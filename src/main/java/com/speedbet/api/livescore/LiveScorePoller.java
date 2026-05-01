@@ -240,15 +240,23 @@ public class LiveScorePoller {
      * completes. This ensures the next HTTP request re-queries the DB with
      * the full dataset rather than serving a stale empty or partial result
      * that was cached mid-poll.
+     *
+     * Logs each cache name and whether it was found in the CacheManager so
+     * mismatches between declared cache names and actual registrations are
+     * immediately visible in production logs.
      */
     private void evictMatchCaches() {
-        for (String name : List.of("matches", "todayMatches", "futureMatches", "featuredMatches")) {
+        List<String> names = List.of("matches", "todayMatches", "futureMatches", "featuredMatches");
+        int cleared = 0;
+        for (String name : names) {
             Cache cache = cacheManager.getCache(name);
+            log.info("evictMatchCaches: cache='{}' found={}", name, cache != null);
             if (cache != null) {
                 cache.clear();
+                cleared++;
             }
         }
-        log.debug("evictMatchCaches: all match caches cleared after poll.");
+        log.info("evictMatchCaches: done — {}/{} caches cleared.", cleared, names.size());
     }
 
     // ═══════════════════════════════════════════════════════════════════════
