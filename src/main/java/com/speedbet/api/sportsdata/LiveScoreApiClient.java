@@ -108,7 +108,7 @@ public class LiveScoreApiClient {
 
     // ── API key pairs (key + secret) ──────────────────────────────────────
     private final List<String[]> apiCredentials = List.of(
-            new String[]{"nIznBfFZuqhOnB3h",   "fwDKGjvEE8Qh1XMpGmNhBsh5TyUgaXyp"},
+            new String[]{"Y7JvzQYJm1c4Vlyh",  "aRZDfUJzl1HOfVae3TJCKIl6JyaFUJX4"},
             new String[]{"TA16A6HrD4mYThZ8",  "6QXYN60QILflOkUHUVOv2vXGzkFtBFCH"} // Primary
 
     );
