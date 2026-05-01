@@ -47,7 +47,6 @@ public class PaystackController {
         if (amount.compareTo(minDeposit) < 0)
             throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
 
-        // Amount in pesewas (kobo equivalent)
         var amountKobo = amount.multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64).intValue();
 
         @SuppressWarnings("unchecked")
@@ -59,7 +58,7 @@ public class PaystackController {
                         "email", user.getEmail(),
                         "amount", amountKobo,
                         "currency", "GHS",
-                        "callback_url", frontendUrl + "/app/wallet",
+                        "callback_url", frontendUrl + "/app/wallet?payment=success",
                         "metadata", Map.of("userId", user.getId().toString())
                 ))
                 .retrieve().bodyToMono(Map.class)
