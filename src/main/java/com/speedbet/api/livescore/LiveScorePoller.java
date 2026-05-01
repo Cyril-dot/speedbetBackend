@@ -30,14 +30,25 @@ import java.util.Map;
  *   • Stale LIVE sweep  — every  10min
  *   • Live odds refresh — every   2min
  *
- * Logo enrichment strategy:
- *   The general fixtures endpoint (fixtures/matches.json) never returns team logos.
- *   We warm a TeamLogoCache by calling competition-specific endpoints that DO return
- *   nested home.logo / away.logo. When saving a fixture with blank logos, we look up
- *   the team name in the cache and backfill before persisting.
+ * ── How logos flow through the system ────────────────────────────────────
  *
- *   pollUpcomingFixtures() now calls BOTH the general endpoint AND getTop6Fixtures()
- *   so competition-specific logos are merged in before any fixture is persisted.
+ *   LIVE matches (pollLiveScores):
+ *     matches/live.json always returns nested home.logo / away.logo.
+ *     extractHomeLogo() reads home.logo → logos are always present.
+ *     These are used as the reference shape — everything else mirrors this.
+ *
+ *   TOP-6 fixtures (pollUpcomingFixtures Step A):
+ *     fixtures/matches.json?competition_id=X returns same nested shape as live.
+ *     Logos extracted directly + ingested into TeamLogoCache for later reuse.
+ *
+ *   GENERAL fixtures (pollUpcomingFixtures Step B):
+ *     fixtures/matches.json (no competition_id) returns flat home_image/away_image.
+ *     extractHomeLogo() now reads these flat fields as fallback (fix applied).
+ *     Any remaining blanks are backfilled from TeamLogoCache via enrichLogos().
+ *     Fixtures already saved in Step A are deduplicated by externalId.
+ *
+ *   Result: top-6 fixtures always get logos; other leagues get logos from
+ *           the cache or from flat API fields where available.
  */
 @Slf4j
 @Component
@@ -52,20 +63,23 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 0. LOGO CACHE WARM — runs at startup (delay=2s) then every 6 hours
-    //    Calls competition-specific fixture/live/history endpoints so we
-    //    build a teamName → logoUrl map before the upcoming fixture poll.
+    //
+    //    Calls competition-specific fixture/live/history endpoints which
+    //    return nested home.logo / away.logo (same shape as live scores).
+    //    Ingests results into TeamLogoCache so Step B of upcoming poll can
+    //    backfill logos for general-endpoint fixtures.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 6 * 60 * 60_000L, initialDelay = 2_000L)
     public void warmLogoCache() {
         log.info("=== Logo cache warm starting ===");
         try {
-            // Top-6 fixtures — nested home.logo / away.logo
+            // Top-6 fixtures — nested home.logo / away.logo (same shape as live)
             List<Map<String, Object>> top6 = liveScoreApiClient.getTop6Fixtures();
             teamLogoCache.ingest(top6);
             log.info("Logo cache warm: ingested {} top-6 fixtures", top6.size());
 
-            // Live scores — always carry logos
+            // Live scores — always carry logos, opportunistic warm
             List<Map<String, Object>> live = liveScoreApiClient.getLiveScores();
             teamLogoCache.ingest(live);
 
@@ -83,6 +97,10 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 1. LIVE SCORES — every 30 seconds
+    //
+    //    matches/live.json always returns nested home.logo / away.logo.
+    //    This is the reference shape: extractHomeLogo() reads home.logo first.
+    //    Live logos are used to opportunistically warm TeamLogoCache too.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 30_000L, initialDelay = 5_000L)
@@ -93,7 +111,8 @@ public class LiveScorePoller {
             if (lsLive == null || lsLive.isEmpty()) {
                 log.info("Live poll: no live scores returned.");
             } else {
-                teamLogoCache.ingest(lsLive); // opportunistic cache warm
+                // Live matches always have logos — ingest to warm cache for fixture backfill
+                teamLogoCache.ingest(lsLive);
                 log.info("Live poll: {} live matches received.", lsLive.size());
                 int updated = 0, skipped = 0;
                 for (Map<String, Object> event : lsLive) {
@@ -117,6 +136,8 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 2. TODAY'S FIXTURES — every 15 minutes
+    //
+    //    history endpoint returns logos — ingest to warm cache.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 15 * 60_000L, initialDelay = 10_000L)
@@ -164,18 +185,21 @@ public class LiveScorePoller {
     // ═══════════════════════════════════════════════════════════════════════
     // 3. UPCOMING FIXTURES (next 7 days) — every hour
     //
-    //    Strategy:
-    //      Step A — Call getTop6Fixtures() FIRST. These responses carry full
-    //               home.logo / away.logo / league.logo, so we ingest them
-    //               into TeamLogoCache AND persist the matches directly.
-    //      Step B — Call getUpcomingFixtures() (general endpoint, no logos).
-    //               For each fixture, call enrichLogos() to backfill from the
-    //               cache populated in Step A (and earlier warm runs).
-    //               Fixtures already saved in Step A are deduplicated by
-    //               matchService.saveOrUpdate() via externalId.
+    //    Strategy mirrors how live scores always have logos:
     //
-    //    Result: top-6 league fixtures get logos from the API itself;
-    //            other leagues get logos from the cache where available.
+    //    Step A — getTop6Fixtures() → competition-specific endpoint per league.
+    //             Returns nested home.logo / away.logo (same shape as live).
+    //             Ingest into TeamLogoCache AND persist matches directly.
+    //             These fixtures arrive with logos, exactly like live matches do.
+    //
+    //    Step B — getUpcomingFixtures() → general endpoint (no competition_id).
+    //             Returns flat home_image / away_image (handled by extractHomeLogo).
+    //             enrichLogos() backfills any remaining blanks from TeamLogoCache.
+    //             matchService.saveOrUpdate() deduplicates by externalId so
+    //             Step A fixtures are updated, not duplicated.
+    //
+    //    Outcome: all top-6 fixtures have logos (Step A); other leagues get logos
+    //             from flat API fields or cache where available (Step B).
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 60 * 60_000L, initialDelay = 30_000L)
@@ -183,16 +207,17 @@ public class LiveScorePoller {
         log.info("=== Upcoming fixtures poll starting ===");
         try {
             // ── Step A: top-6 competition-specific fixtures (logos included) ──
+            // Same nested home.logo / away.logo shape as the live endpoint.
             log.info("Upcoming poll [A]: fetching top-6 competition fixtures...");
             List<Map<String, Object>> top6 = liveScoreApiClient.getTop6Fixtures();
             int top6Saved = 0, top6Skipped = 0;
             if (top6 != null && !top6.isEmpty()) {
-                teamLogoCache.ingest(top6); // warm cache with fresh logos
+                teamLogoCache.ingest(top6); // warm cache with fresh logos before Step B
                 for (Map<String, Object> event : top6) {
                     try {
                         Match m = mapLiveScoreApiFixtureToMatch(event);
                         if (m != null && m.getKickoffAt() != null && m.getKickoffAt().isAfter(Instant.now())) {
-                            // Logos already extracted by mapper from the competition endpoint
+                            // Logos already extracted from nested home.logo / away.logo
                             Match persisted = matchService.saveOrUpdate(m);
                             try {
                                 oddsPersistenceService.generateAndSaveAllOdds(persisted);
@@ -215,7 +240,8 @@ public class LiveScorePoller {
                 log.info("Upcoming poll [A]: no top-6 fixtures returned.");
             }
 
-            // ── Step B: general endpoint (no logos — enrich from cache) ──
+            // ── Step B: general endpoint (flat home_image/away_image + cache backfill) ──
+            // extractHomeLogo() reads home_image as fallback; enrichLogos() fills the rest.
             log.info("Upcoming poll [B]: fetching general upcoming fixtures... Logo cache size={}",
                     teamLogoCache.size());
             List<Map<String, Object>> fixtures = liveScoreApiClient.getUpcomingFixtures();
@@ -229,7 +255,8 @@ public class LiveScorePoller {
                         Match m = mapLiveScoreApiFixtureToMatch(event);
                         if (m != null) {
                             if (m.getKickoffAt() != null && m.getKickoffAt().isAfter(Instant.now())) {
-                                logoHits += enrichLogos(m); // backfill from cache
+                                // enrichLogos fills any blanks left after extractHomeLogo
+                                logoHits += enrichLogos(m);
                                 Match persisted = matchService.saveOrUpdate(m);
                                 try {
                                     oddsPersistenceService.generateAndSaveAllOdds(persisted);
@@ -314,8 +341,13 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // LOGO ENRICHMENT
-    // Fills blank homeLogo / awayLogo / leagueLogo from TeamLogoCache.
-    // Returns count of fields filled.
+    //
+    // Called after mapLiveScoreApiFixtureToMatch() to backfill any logos
+    // that extractHomeLogo() could not resolve from the raw API payload.
+    // Uses TeamLogoCache which is warmed from live + competition-specific
+    // endpoints (both of which always return logos).
+    //
+    // Returns count of fields filled (0–3).
     // ═══════════════════════════════════════════════════════════════════════
 
     private int enrichLogos(Match match) {
@@ -356,6 +388,13 @@ public class LiveScorePoller {
     // MAPPERS
     // ═══════════════════════════════════════════════════════════════════════
 
+    /**
+     * Maps a live score API event to a Match entity.
+     *
+     * Uses the same extractHomeLogo() / extractAwayLogo() that live scores do —
+     * these read home.logo from the nested "home" object, which is always present
+     * in the live endpoint response.
+     */
     private Match mapLiveScoreApiMatchToMatch(Map<String, Object> event, boolean forceStatusLive) {
         if (event == null) return null;
 
@@ -379,11 +418,11 @@ public class LiveScorePoller {
 
         match.setHomeTeam(LiveScoreApiClient.extractHomeName(event));
         match.setAwayTeam(LiveScoreApiClient.extractAwayName(event));
-        match.setHomeLogo(LiveScoreApiClient.extractHomeLogo(event));
-        match.setAwayLogo(LiveScoreApiClient.extractAwayLogo(event));
+        match.setHomeLogo(LiveScoreApiClient.extractHomeLogo(event));   // reads home.logo (nested)
+        match.setAwayLogo(LiveScoreApiClient.extractAwayLogo(event));   // reads away.logo (nested)
         match.setLeague(LiveScoreApiClient.extractCompetitionName(event));
         match.setLeagueLogo(LiveScoreApiClient.extractLeagueLogo(event));
-        enrichLogos(match); // fill any blanks from cache
+        enrichLogos(match); // fill any blanks from cache (defensive)
 
         String scoreStr = LiveScoreApiClient.extractScore(event);
         if (scoreStr != null && scoreStr.contains("-")) {
@@ -419,6 +458,16 @@ public class LiveScorePoller {
         return match;
     }
 
+    /**
+     * Maps a fixture API event to a Match entity.
+     *
+     * Handles both response shapes:
+     *   - Competition-specific (Step A): nested home.logo / away.logo
+     *   - General endpoint (Step B):     flat home_image / away_image
+     *
+     * extractHomeLogo() resolves whichever field is present.
+     * enrichLogos() is called by the caller (Step B) to fill any remaining blanks.
+     */
     private Match mapLiveScoreApiFixtureToMatch(Map<String, Object> event) {
         if (event == null) return null;
 
@@ -433,8 +482,8 @@ public class LiveScorePoller {
             return null;
         }
 
-        String homeLogo   = LiveScoreApiClient.extractHomeLogo(event);
-        String awayLogo   = LiveScoreApiClient.extractAwayLogo(event);
+        String homeLogo   = LiveScoreApiClient.extractHomeLogo(event);   // nested OR flat fallback
+        String awayLogo   = LiveScoreApiClient.extractAwayLogo(event);   // nested OR flat fallback
         String leagueLogo = LiveScoreApiClient.extractLeagueLogo(event);
 
         log.debug("mapLiveScoreApiFixtureToMatch: id={} home='{}' homeLogo='{}' awayLogo='{}'",

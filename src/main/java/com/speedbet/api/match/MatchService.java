@@ -52,6 +52,27 @@ public class MatchService {
         return val == null || val.isBlank();
     }
 
+    /**
+     * Returns true if both team logos are present and non-blank.
+     * Used to sort logo-complete matches to the top of any list shown in
+     * the frontend, so fixtures from well-covered leagues (PL, Bundesliga,
+     * etc.) display instead of lower-tier fixtures that lack artwork.
+     */
+    private static boolean hasLogos(Match m) {
+        return !isMissing(m.getHomeLogo()) && !isMissing(m.getAwayLogo());
+    }
+
+    /**
+     * Stable logo-aware comparator: logo-complete matches first, then sort
+     * by kickoff ascending within each group.
+     *
+     * Using Comparator.comparingInt keeps the sort O(n log n) with no
+     * extra allocations — 0 = has logos, 1 = missing logos.
+     */
+    private static final Comparator<Match> LOGO_THEN_KICKOFF =
+            Comparator.comparingInt((Match m) -> hasLogos(m) ? 0 : 1)
+                    .thenComparing(m -> m.getKickoffAt() != null ? m.getKickoffAt() : Instant.MAX);
+
     // ══════════════════════════════════════════════════════════════════════
     // INTERNAL HELPERS
     // ══════════════════════════════════════════════════════════════════════
@@ -119,8 +140,19 @@ public class MatchService {
     public List<Match> getUpcomingMatches() {
         Instant now = Instant.now();
         List<Match> matches = matchRepo.findUpcomingScheduled(now, now.plus(7, ChronoUnit.DAYS));
-        log.info("getUpcomingMatches: {} upcoming match(es) (next 7 days)", matches.size());
-        return matches;
+
+        // Sort: logo-complete matches first (so the frontend shows well-covered
+        // leagues like PL/Bundesliga rather than logo-less lower-tier fixtures),
+        // then ascending kickoff within each group.
+        List<Match> sorted = matches.stream()
+                .sorted(LOGO_THEN_KICKOFF)
+                .toList();
+
+        int withLogos    = (int) sorted.stream().filter(MatchService::hasLogos).count();
+        int withoutLogos = sorted.size() - withLogos;
+        log.info("getUpcomingMatches: {} upcoming match(es) — {} with logos, {} without (logo-first sort applied)",
+                sorted.size(), withLogos, withoutLogos);
+        return sorted;
     }
 
     @Cacheable("todayMatches")
@@ -136,8 +168,18 @@ public class MatchService {
     public List<Match> getFutureMatches() {
         Instant now = Instant.now();
         List<Match> matches = matchRepo.findUpcomingScheduled(now, now.plus(7, ChronoUnit.DAYS));
-        log.info("getFutureMatches: {} match(es) next 7 days", matches.size());
-        return matches;
+
+        // Same logo-first sort as getUpcomingMatches — both feed the same
+        // frontend surfaces.
+        List<Match> sorted = matches.stream()
+                .sorted(LOGO_THEN_KICKOFF)
+                .toList();
+
+        int withLogos    = (int) sorted.stream().filter(MatchService::hasLogos).count();
+        int withoutLogos = sorted.size() - withLogos;
+        log.info("getFutureMatches: {} match(es) next 7 days — {} with logos, {} without (logo-first sort applied)",
+                sorted.size(), withLogos, withoutLogos);
+        return sorted;
     }
 
     public List<Match> getRecentResults() {
@@ -172,10 +214,14 @@ public class MatchService {
 
     public List<Map<String, Object>> withOdds(List<Match> matches) {
         if (matches.isEmpty()) return Collections.emptyList();
-        log.debug("withOdds: bundling odds for {} match(es)", matches.size());
 
-        List<Map<String, Object>> out = new ArrayList<>(matches.size());
-        for (Match match : matches) {
+        // Apply logo-first sort before bundling so callers that pass a raw
+        // repo list (e.g. getLiveMatches()) also benefit from the ordering.
+        List<Match> sorted = matches.stream().sorted(LOGO_THEN_KICKOFF).toList();
+        log.debug("withOdds: bundling odds for {} match(es)", sorted.size());
+
+        List<Map<String, Object>> out = new ArrayList<>(sorted.size());
+        for (Match match : sorted) {
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("match", match);
 
@@ -199,10 +245,13 @@ public class MatchService {
 
     public List<Map<String, Object>> withAllOdds(List<Match> matches) {
         if (matches.isEmpty()) return Collections.emptyList();
-        log.debug("withAllOdds: bundling all markets for {} match(es)", matches.size());
 
-        List<Map<String, Object>> out = new ArrayList<>(matches.size());
-        for (Match match : matches) {
+        // Same logo-first sort as withOdds.
+        List<Match> sorted = matches.stream().sorted(LOGO_THEN_KICKOFF).toList();
+        log.debug("withAllOdds: bundling all markets for {} match(es)", sorted.size());
+
+        List<Map<String, Object>> out = new ArrayList<>(sorted.size());
+        for (Match match : sorted) {
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("match", match);
 
@@ -524,8 +573,9 @@ public class MatchService {
                     if (existing.getKickoffAt()  == null && match.getKickoffAt()  != null) existing.setKickoffAt(match.getKickoffAt());
                     if (existing.getSource()     == null && match.getSource()     != null) existing.setSource(match.getSource());
 
-                    log.debug("saveOrUpdate: updated externalId={} home='{}' away='{}'",
-                            existing.getExternalId(), existing.getHomeTeam(), existing.getAwayTeam());
+                    log.debug("saveOrUpdate: updated externalId={} home='{}' away='{}' homeLogo='{}' awayLogo='{}'",
+                            existing.getExternalId(), existing.getHomeTeam(), existing.getAwayTeam(),
+                            existing.getHomeLogo(), existing.getAwayLogo());
                     return matchRepo.save(existing);
                 })
                 .orElseGet(() -> {

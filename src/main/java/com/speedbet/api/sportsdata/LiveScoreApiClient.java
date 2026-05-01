@@ -30,21 +30,34 @@ import java.util.concurrent.*;
  *
  * ── Response shape differences ───────────────────────────────────────────
  *
- *   COMPETITION-SPECIFIC endpoints (fixtures/matches.json?competition_id=X):
+ *   LIVE endpoint (matches/live.json):
  *     home.name / away.name     — nested objects
- *     home.logo / away.logo     — nested logo URL
+ *     home.logo / away.logo     — nested logo URL  ← ALWAYS present for live
+ *     scores.score              — "1 - 0" format
+ *     time                      — match clock e.g. "45", "HT", "FT"
+ *     list key: "match"
+ *
+ *   COMPETITION-SPECIFIC fixture endpoints (fixtures/matches.json?competition_id=X):
+ *     home.name / away.name     — nested objects
+ *     home.logo / away.logo     — nested logo URL  ← present
  *     scheduled                 — full ISO string e.g. "2026-05-01T10:00:00"
  *     fixture_id                — fixture identifier
  *     list key: "fixture"
  *
- *   GENERAL endpoints (fixtures/matches.json with no competition_id):
+ *   GENERAL fixture endpoint (fixtures/matches.json with no competition_id):
  *     home_name / away_name     — flat strings
- *     home_image / away_image   — flat logo URL  ← FIX: was not being read
+ *     home_image / away_image   — flat logo URL  ← extractHomeLogo reads these
  *     date + time               — separate fields e.g. date="2026-05-01" time="10:00:00"
  *     id                        — used as fixture identifier (no fixture_id field)
  *     list key: "fixtures"
  *
- * All extractor methods handle BOTH shapes via fallback logic.
+ * All extractor methods handle ALL three shapes via fallback chains.
+ *
+ * ── Logo extraction priority (extractHomeLogo / extractAwayLogo) ─────────
+ *   1. home.logo          — nested, competition-specific + live endpoints
+ *   2. home.image         — nested alt key (some endpoints)
+ *   3. home_image         — flat, general fixture endpoint
+ *   4. home_logo          — flat alt key
  *
  * ── Endpoints used ───────────────────────────────────────────────────────
  *   GET /api-client/matches/live.json
@@ -354,7 +367,12 @@ public class LiveScoreApiClient {
 
     /**
      * All upcoming fixtures — general endpoint.
-     * Response: flat home_name/away_name/home_image/away_image, separate date/time, list key "fixtures".
+     * Response shape: flat home_name/away_name/home_image/away_image, separate date/time.
+     * List key: "fixtures".
+     *
+     * NOTE: this endpoint does NOT return logos for most fixtures.
+     *       Logo enrichment is handled in LiveScorePoller via TeamLogoCache.
+     *       extractHomeLogo / extractAwayLogo read home_image / away_image as fallback.
      */
     public List<Map<String, Object>> getUpcomingFixtures() {
         return cached("fixtures:all", () -> {
@@ -374,7 +392,12 @@ public class LiveScoreApiClient {
 
     /**
      * Top-6 upcoming fixtures — competition-specific endpoint per league.
-     * Response: nested home.name/away.name/home.logo/away.logo, "scheduled" ISO string, list key "fixture".
+     * Response shape: nested home.name/away.name/home.logo/away.logo, "scheduled" ISO string.
+     * List key: "fixture".
+     *
+     * These ARE the reference for how logos work — same nested shape as live scores.
+     * LiveScorePoller calls this first (Step A) to warm TeamLogoCache before
+     * processing the general fixture endpoint (Step B).
      */
     public List<Map<String, Object>> getTop6Fixtures() {
         return cached("fixtures:top6", () -> {
@@ -568,7 +591,8 @@ public class LiveScoreApiClient {
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    //  FIELD EXTRACTION — handle BOTH response shapes
+    //  FIELD EXTRACTION — handles ALL three response shapes
+    //  (live, competition-specific fixture, general fixture)
     // ═════════════════════════════════════════════════════════════════════
 
     public static String extractMatchId(Map<String, Object> match) {
@@ -590,8 +614,8 @@ public class LiveScoreApiClient {
 
     /**
      * Home team name.
-     * Competition-specific: home.name (nested)
-     * General endpoint:     home_name (flat)
+     * Live + competition-specific: home.name (nested object)
+     * General fixture endpoint:    home_name (flat string)
      */
     public static String extractHomeName(Map<String, Object> match) {
         Object home = match.get("home");
@@ -605,8 +629,8 @@ public class LiveScoreApiClient {
 
     /**
      * Away team name.
-     * Competition-specific: away.name (nested)
-     * General endpoint:     away_name (flat)
+     * Live + competition-specific: away.name (nested object)
+     * General fixture endpoint:    away_name (flat string)
      */
     public static String extractAwayName(Map<String, Object> match) {
         Object away = match.get("away");
@@ -621,17 +645,18 @@ public class LiveScoreApiClient {
     /**
      * Home team logo URL.
      *
-     * FIX: The general endpoint (fixtures/matches.json, no competition_id) does NOT
-     * return a nested "home" object. Logos are flat fields. We now check all known
-     * field names in priority order:
-     *
-     *   1. home.logo          — competition-specific nested shape
+     * Priority order — mirrors how the LIVE endpoint works (which always has logos):
+     *   1. home.logo          — live endpoint + competition-specific nested shape
      *   2. home.image         — alternative nested key used by some endpoints
-     *   3. home_image         — general endpoint flat field  ← was missing before
+     *   3. home_image         — general fixture endpoint flat field
      *   4. home_logo          — alternative flat key
+     *
+     * The live endpoint always returns shape 1 (home.logo), which is why live
+     * matches always have logos. We apply the same chain so fixture endpoints
+     * also resolve correctly regardless of which shape they use.
      */
     public static String extractHomeLogo(Map<String, Object> match) {
-        // 1 & 2 — nested "home" object (competition-specific endpoint)
+        // 1 & 2 — nested "home" object (live + competition-specific endpoints)
         Object home = match.get("home");
         if (home instanceof Map<?, ?> homeMap) {
             Object logo = ((Map<?, ?>) homeMap).get("logo");
@@ -639,7 +664,7 @@ public class LiveScoreApiClient {
             Object image = ((Map<?, ?>) homeMap).get("image");
             if (image != null && !image.toString().isBlank()) return image.toString();
         }
-        // 3 — flat "home_image" (general endpoint)
+        // 3 — flat "home_image" (general fixture endpoint)
         Object homeImage = match.get("home_image");
         if (homeImage != null && !homeImage.toString().isBlank()) return homeImage.toString();
         // 4 — flat "home_logo" (alternative flat key)
@@ -652,15 +677,14 @@ public class LiveScoreApiClient {
     /**
      * Away team logo URL.
      *
-     * FIX: mirrors extractHomeLogo — adds flat-field fallbacks for the general endpoint.
-     *
-     *   1. away.logo          — competition-specific nested shape
+     * Priority order — mirrors extractHomeLogo:
+     *   1. away.logo          — live endpoint + competition-specific nested shape
      *   2. away.image         — alternative nested key
-     *   3. away_image         — general endpoint flat field  ← was missing before
+     *   3. away_image         — general fixture endpoint flat field
      *   4. away_logo          — alternative flat key
      */
     public static String extractAwayLogo(Map<String, Object> match) {
-        // 1 & 2 — nested "away" object (competition-specific endpoint)
+        // 1 & 2 — nested "away" object (live + competition-specific endpoints)
         Object away = match.get("away");
         if (away instanceof Map<?, ?> awayMap) {
             Object logo = ((Map<?, ?>) awayMap).get("logo");
@@ -668,7 +692,7 @@ public class LiveScoreApiClient {
             Object image = ((Map<?, ?>) awayMap).get("image");
             if (image != null && !image.toString().isBlank()) return image.toString();
         }
-        // 3 — flat "away_image" (general endpoint)
+        // 3 — flat "away_image" (general fixture endpoint)
         Object awayImage = match.get("away_image");
         if (awayImage != null && !awayImage.toString().isBlank()) return awayImage.toString();
         // 4 — flat "away_logo" (alternative flat key)
@@ -703,8 +727,10 @@ public class LiveScoreApiClient {
 
     /**
      * Match clock / status string (e.g. "45", "FT", "HT").
-     * NOTE: on the general endpoint the "time" field holds the kickoff time
-     * (e.g. "10:00:00"), not the match clock. Use this only for live match data.
+     *
+     * NOTE: on the GENERAL fixture endpoint the "time" field holds the kickoff
+     * time (e.g. "10:00:00"), not a match clock. Only use this for live data
+     * where the field actually represents elapsed minutes or status markers.
      */
     public static String extractMatchTime(Map<String, Object> match) {
         Object time = match.get("time");
@@ -729,20 +755,24 @@ public class LiveScoreApiClient {
     }
 
     /**
-     * Builds a UTC Instant for kickoff — handles both API response shapes.
+     * Builds a UTC Instant for kickoff — handles all three API response shapes.
      *
-     * Shape 1 — Competition-specific (fixtures/matches.json?competition_id=X):
+     * Shape 1 — Live (matches/live.json):
+     *   "date": "2026-05-01"  +  "time": "45" (match clock, not kickoff)
+     *   → kickoff = date combined with a fallback or stored kickoffAt (not reconstructable here)
+     *
+     * Shape 2 — Competition-specific (fixtures/matches.json?competition_id=X):
      *   "scheduled": "2026-05-01T10:00:00"  → parsed as LocalDateTime UTC
      *   "scheduled": "10:00"                 → combined with "date" field
      *
-     * Shape 2 — General (fixtures/matches.json, no competition_id):
+     * Shape 3 — General (fixtures/matches.json, no competition_id):
      *   "date": "2026-05-01"  +  "time": "10:00:00"  → combined as UTC Instant
      *
      * Returns null if required fields are missing or unparseable.
      */
     public static Instant buildKickoffInstant(Map<String, Object> match) {
 
-        // ── Shape 1: "scheduled" field (competition-specific endpoint) ────
+        // ── Shape 2: "scheduled" field (competition-specific endpoint) ────
         Object scheduledObj = match.get("scheduled");
         if (scheduledObj != null && !scheduledObj.toString().isBlank()) {
             String scheduled = scheduledObj.toString();
@@ -756,7 +786,7 @@ public class LiveScoreApiClient {
             // Bare "HH:mm" — fall through to combine with date below
         }
 
-        // ── Shape 2: "date" + "time" fields (general endpoint) ───────────
+        // ── Shape 3: "date" + "time" fields (general fixture endpoint) ───
         String date    = extractMatchDate(match);
         String timeStr = "";
 
@@ -765,7 +795,7 @@ public class LiveScoreApiClient {
         if (timeObj != null && !timeObj.toString().isBlank()) {
             timeStr = timeObj.toString();
         } else if (scheduledObj != null && !scheduledObj.toString().isBlank()) {
-            // Bare HH:mm from "scheduled" field
+            // Bare HH:mm from "scheduled" field (shape 2 partial)
             timeStr = scheduledObj.toString();
         }
 
@@ -794,7 +824,7 @@ public class LiveScoreApiClient {
             Object name = ((Map<?, ?>) compMap).get("name");
             if (name != null) return name.toString();
         }
-        // General endpoint may expose competition name as a flat field
+        // General endpoint exposes competition name as a flat field
         Object compName = match.get("competition_name");
         if (compName != null && !compName.toString().isBlank()) return compName.toString();
         return "";
@@ -802,8 +832,8 @@ public class LiveScoreApiClient {
 
     /**
      * League/competition logo URL.
-     * Competition-specific: competition.logo (nested)
-     * General endpoint:     competition_logo (flat)
+     * Live + competition-specific: competition.logo or competition.image (nested)
+     * General endpoint:            competition_logo or league_logo (flat)
      */
     public static String extractLeagueLogo(Map<String, Object> match) {
         Object comp = match.get("competition");
@@ -917,7 +947,6 @@ public class LiveScoreApiClient {
     private static void sleepQuietly(long ms) {
         try { Thread.sleep(ms); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
-
 
     private static class SkipKeyException extends RuntimeException {
         SkipKeyException(String msg) { super(msg); }
