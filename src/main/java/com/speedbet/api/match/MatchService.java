@@ -136,7 +136,6 @@ public class MatchService {
         return matches;
     }
 
-    @Cacheable("matches")
     public List<Match> getUpcomingMatches() {
         Instant now = Instant.now();
         List<Match> matches = matchRepo.findUpcomingScheduled(now, now.plus(7, ChronoUnit.DAYS));
@@ -164,7 +163,6 @@ public class MatchService {
         return matches;
     }
 
-    @Cacheable("futureMatches")
     public List<Match> getFutureMatches() {
         Instant now = Instant.now();
         List<Match> matches = matchRepo.findUpcomingScheduled(now, now.plus(7, ChronoUnit.DAYS));
@@ -549,7 +547,7 @@ public class MatchService {
     // ══════════════════════════════════════════════════════════════════════
 
     @Transactional
-    @CacheEvict(value = {"featuredMatches", "todayMatches"}, allEntries = true)
+    @CacheEvict(value = {"matches", "featuredMatches", "todayMatches", "futureMatches"}, allEntries = true)
     public Match saveOrUpdate(Match match) {
         if (match.getExternalId() == null || match.getExternalId().isBlank())
             return matchRepo.save(match);
