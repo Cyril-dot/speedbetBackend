@@ -28,28 +28,41 @@ import java.util.concurrent.*;
  * Base URL  : https://livescore-api.com
  * Auth      : key + secret query params
  *
- * DEMO DATA DISABLED: All getDemoXxx() methods removed. When the API returns
- * no data or all keys are exhausted, empty collections / empty maps are
- * returned so the UI can handle the no-data state gracefully.
+ * ── Response shape differences ───────────────────────────────────────────
  *
- * ── Endpoints used ──────────────────────────────────────────────────────────
- *   GET /api-client/matches/live.json                          → live scores (all)
- *   GET /api-client/matches/live.json?competition_id=X         → live scores by league
- *   GET /api-client/matches/history.json?from=YYYY-MM-DD&to=YYYY-MM-DD → today/past results
- *   GET /api-client/fixtures/matches.json?competition_id=X    → upcoming fixtures
- *   GET /api-client/matches/stats.json?match_id=X             → match statistics
- *   GET /api-client/matches/lineups.json?match_id=X           → match lineups
- *   GET /api-client/scores/events.json?id=X                   → match events (goals, cards)
- *   GET /api-client/matches/commentary.json?match_id=X        → live commentary
- *   GET /api-client/standings/table.json?competition_id=X     → league standings
- *   GET /api-client/standings/live.json?competition_id=X      → live standings
- *   GET /api-client/competitions/list.json                    → all competitions
- *   GET /api-client/teams/head2head.json?team1_id=X&team2_id=Y → head to head
- *   GET /api-client/teams/list.json?competition_id=X          → teams in league
- *   GET /api-client/teams/matches.json?team_id=X              → team last matches
- *   GET /api-client/countries/list.json                       → countries list
- *   GET /api-client/seasons/list.json                         → seasons list
- *   GET /api-client/users/pair.json                           → verify credentials
+ *   COMPETITION-SPECIFIC endpoints (fixtures/matches.json?competition_id=X):
+ *     home.name / away.name     — nested objects
+ *     scheduled                 — full ISO string e.g. "2026-05-01T10:00:00"
+ *     fixture_id                — fixture identifier
+ *     list key: "fixture"
+ *
+ *   GENERAL endpoints (fixtures/matches.json with no competition_id):
+ *     home_name / away_name     — flat strings
+ *     date + time               — separate fields e.g. date="2026-05-01" time="10:00:00"
+ *     id                        — used as fixture identifier (no fixture_id field)
+ *     list key: "fixtures"
+ *
+ * All extractor methods handle BOTH shapes via fallback logic.
+ *
+ * ── Endpoints used ───────────────────────────────────────────────────────
+ *   GET /api-client/matches/live.json
+ *   GET /api-client/matches/live.json?competition_id=X
+ *   GET /api-client/matches/history.json?from=YYYY-MM-DD&to=YYYY-MM-DD
+ *   GET /api-client/fixtures/matches.json?competition_id=X
+ *   GET /api-client/fixtures/matches.json                    (general, all upcoming)
+ *   GET /api-client/matches/stats.json?match_id=X
+ *   GET /api-client/matches/lineups.json?match_id=X
+ *   GET /api-client/scores/events.json?id=X
+ *   GET /api-client/matches/commentary.json?match_id=X
+ *   GET /api-client/standings/table.json?competition_id=X
+ *   GET /api-client/standings/live.json?competition_id=X
+ *   GET /api-client/competitions/list.json
+ *   GET /api-client/teams/head2head.json?team1_id=X&team2_id=Y
+ *   GET /api-client/teams/list.json?competition_id=X
+ *   GET /api-client/teams/matches.json?team_id=X
+ *   GET /api-client/countries/list.json
+ *   GET /api-client/seasons/list.json
+ *   GET /api-client/users/pair.json
  */
 @Slf4j
 @Component
@@ -60,29 +73,21 @@ public class LiveScoreApiClient {
 
     private static final String BASE_URL = "https://livescore-api.com";
 
-    /** Inter-key delay (ms) */
     private static final long KEY_ROTATE_DELAY_MS = 150;
-
-    /** Retry same key once on transient network errors */
-    private static final int TRANSIENT_RETRIES = 1;
-
-    /** Cooldown duration for rate-limited keys (5 minutes) */
-    private static final long KEY_COOLDOWN_MS = 5 * 60_000L;
-
-    /** Cache TTL for static/semi-static data (minutes) */
-    private static final long CACHE_TTL_MINUTES = 5;
+    private static final int  TRANSIENT_RETRIES   = 1;
+    private static final long KEY_COOLDOWN_MS     = 5 * 60_000L;
+    private static final long CACHE_TTL_MINUTES   = 5;
 
     // ── Top 6 League competition IDs ──────────────────────────────────────
     public static final Map<String, Integer> TOP_6_COMPETITION_IDS = Map.of(
-            "Premier League",     2,
-            "La Liga",            5,
-            "Bundesliga",         1,
-            "Serie A",            8,
-            "Ligue 1",            4,
-            "Champions League",   244
+            "Premier League",   2,
+            "La Liga",          5,
+            "Bundesliga",       1,
+            "Serie A",          8,
+            "Ligue 1",          4,
+            "Champions League", 244
     );
 
-    // All major competition IDs
     public static final Map<String, Integer> ALL_COMPETITION_IDS = new LinkedHashMap<>() {{
         put("Premier League",       2);
         put("La Liga",              5);
@@ -106,11 +111,10 @@ public class LiveScoreApiClient {
         put("FA Cup",               85);
     }};
 
-    // ── API key pairs (key + secret) ──────────────────────────────────────
+    // ── API key pairs ─────────────────────────────────────────────────────
     private final List<String[]> apiCredentials = List.of(
-            new String[]{"Y7JvzQYJm1c4Vlyh",  "aRZDfUJzl1HOfVae3TJCKIl6JyaFUJX4"},
-            new String[]{"TA16A6HrD4mYThZ8",  "6QXYN60QILflOkUHUVOv2vXGzkFtBFCH"} // Primary
-
+            new String[]{"Y7JvzQYJm1c4Vlyh", "aRZDfUJzl1HOfVae3TJCKIl6JyaFUJX4"},
+            new String[]{"TA16A6HrD4mYThZ8", "6QXYN60QILflOkUHUVOv2vXGzkFtBFCH"}
     );
 
     private final WebClient    client;
@@ -132,8 +136,7 @@ public class LiveScoreApiClient {
                 .codecs(c -> c.defaultCodecs().maxInMemorySize(10 * 1024 * 1024))
                 .build();
         if (demoMode) {
-            log.info("LiveScoreApiClient: demo-mode flag detected but demo data is disabled. " +
-                    "Real API calls will be made; empty results returned on failure.");
+            log.info("LiveScoreApiClient: demo-mode flag detected; real API calls will be made.");
         }
     }
 
@@ -196,7 +199,7 @@ public class LiveScoreApiClient {
                                     return Mono.error(new SkipKeyException("Rate limited: HTTP " + status));
                                 }
                                 if (status >= 500) {
-                                    log.warn("LiveScoreAPI [{}] key ...{} → HTTP {} (server error), trying next",
+                                    log.warn("LiveScoreAPI [{}] key ...{} → HTTP {} (server error)",
                                             path, tail(key), status);
                                     return Mono.error(new SkipKeyException("Server error: HTTP " + status));
                                 }
@@ -236,11 +239,8 @@ public class LiveScoreApiClient {
             sleepQuietly(KEY_ROTATE_DELAY_MS);
         }
 
-        if (usableKeys == 0) {
-            log.warn("LiveScoreAPI [{}] → ALL keys on cooldown, returning null", path);
-        } else {
-            log.error("LiveScoreAPI [{}] → ALL {} usable keys exhausted, returning null", path, usableKeys);
-        }
+        if (usableKeys == 0) log.warn("LiveScoreAPI [{}] → ALL keys on cooldown", path);
+        else log.error("LiveScoreAPI [{}] → ALL {} usable keys exhausted", path, usableKeys);
         return null;
     }
 
@@ -268,8 +268,6 @@ public class LiveScoreApiClient {
     //  PUBLIC API METHODS
     // ═════════════════════════════════════════════════════════════════════
 
-    // ── 1. Verify credentials ─────────────────────────────────────────────
-
     public boolean verifyCredentials() {
         Map<String, Object> result = callWithFallback("users/pair.json");
         if (result == null) return false;
@@ -277,64 +275,45 @@ public class LiveScoreApiClient {
         return success != null && !"false".equals(success.toString());
     }
 
-    // ── 2. Live Scores ────────────────────────────────────────────────────
+    // ── Live Scores ───────────────────────────────────────────────────────
 
-    /**
-     * Get all currently live matches across all competitions.
-     * Returns empty list if API is unavailable — no demo fallback.
-     */
     public List<Map<String, Object>> getLiveScores() {
         Map<String, Object> result = callWithFallback("matches/live.json");
-        if (result == null) {
-            log.warn("getLiveScores: API returned null, returning empty list");
-            return Collections.emptyList();
-        }
+        if (result == null) { log.warn("getLiveScores: null response"); return Collections.emptyList(); }
         return extractMatchList(result, "data", "match");
     }
 
-    /**
-     * Get live scores for the top 6 leagues only.
-     */
     public List<Map<String, Object>> getTop6LiveScores() {
         List<Map<String, Object>> all = new ArrayList<>();
         for (Map.Entry<String, Integer> entry : TOP_6_COMPETITION_IDS.entrySet()) {
             Map<String, Object> result = callWithFallback(
                     "matches/live.json?competition_id=" + entry.getValue());
-            if (result != null) {
-                all.addAll(extractMatchList(result, "data", "match"));
-            }
+            if (result != null) all.addAll(extractMatchList(result, "data", "match"));
             sleepQuietly(200);
         }
         return all;
     }
 
     public List<Map<String, Object>> getLiveScoresByCompetition(int competitionId) {
-        Map<String, Object> result = callWithFallback(
-                "matches/live.json?competition_id=" + competitionId);
+        Map<String, Object> result = callWithFallback("matches/live.json?competition_id=" + competitionId);
         if (result == null) return Collections.emptyList();
         return extractMatchList(result, "data", "match");
     }
 
     public List<Map<String, Object>> getLiveScoresByTeam(int teamId) {
-        Map<String, Object> result = callWithFallback(
-                "matches/live.json?team_id=" + teamId);
+        Map<String, Object> result = callWithFallback("matches/live.json?team_id=" + teamId);
         if (result == null) return Collections.emptyList();
         return extractMatchList(result, "data", "match");
     }
 
     public List<Map<String, Object>> getLiveScoresByCountry(int countryId) {
-        Map<String, Object> result = callWithFallback(
-                "matches/live.json?country_id=" + countryId);
+        Map<String, Object> result = callWithFallback("matches/live.json?country_id=" + countryId);
         if (result == null) return Collections.emptyList();
         return extractMatchList(result, "data", "match");
     }
 
-    // ── 3. Today's Matches ────────────────────────────────────────────────
+    // ── Today's Matches ───────────────────────────────────────────────────
 
-    /**
-     * Get all matches played or scheduled for today.
-     * Uses matches/history.json with from+to date params (correct endpoint).
-     */
     public List<Map<String, Object>> getTodayMatches() {
         String today = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
         return cached("today:" + today, () -> {
@@ -360,10 +339,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /**
-     * Get matches for a specific date.
-     * Uses matches/history.json with from+to — the correct endpoint and params.
-     */
     public List<Map<String, Object>> getMatchesByDate(String date) {
         return cached("history:" + date, () -> {
             Map<String, Object> result = callWithFallback(
@@ -373,17 +348,17 @@ public class LiveScoreApiClient {
         });
     }
 
-    // ── 4. Upcoming Fixtures ──────────────────────────────────────────────
+    // ── Upcoming Fixtures ─────────────────────────────────────────────────
 
     /**
-     * Get all upcoming fixtures.
-     * Returns empty list if API is unavailable — no demo fallback.
+     * All upcoming fixtures — general endpoint.
+     * Response: flat home_name/away_name, separate date/time, list key "fixtures".
      */
     public List<Map<String, Object>> getUpcomingFixtures() {
         return cached("fixtures:all", () -> {
             Map<String, Object> result = callWithFallback("fixtures/matches.json");
             if (result == null) return Collections.emptyList();
-            return extractMatchList(result, "data", "fixture");
+            return extractFixtureList(result);
         });
     }
 
@@ -391,13 +366,13 @@ public class LiveScoreApiClient {
         return cached("fixtures:" + date, () -> {
             Map<String, Object> result = callWithFallback("fixtures/matches.json?date=" + date);
             if (result == null) return Collections.emptyList();
-            return extractMatchList(result, "data", "fixture");
+            return extractFixtureList(result);
         });
     }
 
     /**
-     * Get upcoming fixtures for top 6 leagues.
-     * Returns empty list if API is unavailable — no demo fallback.
+     * Top-6 upcoming fixtures — competition-specific endpoint per league.
+     * Response: nested home.name/away.name, "scheduled" ISO string, list key "fixture".
      */
     public List<Map<String, Object>> getTop6Fixtures() {
         return cached("fixtures:top6", () -> {
@@ -405,9 +380,14 @@ public class LiveScoreApiClient {
             for (Map.Entry<String, Integer> entry : TOP_6_COMPETITION_IDS.entrySet()) {
                 Map<String, Object> result = callWithFallback(
                         "fixtures/matches.json?competition_id=" + entry.getValue());
-                if (result != null) all.addAll(extractMatchList(result, "data", "fixture"));
+                if (result != null) {
+                    List<Map<String, Object>> fixtures = extractMatchList(result, "data", "fixture");
+                    log.info("getTop6Fixtures: {} fixtures for {}", fixtures.size(), entry.getKey());
+                    all.addAll(fixtures);
+                }
                 sleepQuietly(200);
             }
+            log.info("getTop6Fixtures: {} total fixtures across top 6 leagues", all.size());
             return all;
         });
     }
@@ -422,13 +402,12 @@ public class LiveScoreApiClient {
     }
 
     public List<Map<String, Object>> getFixturesByTeam(int teamId) {
-        Map<String, Object> result = callWithFallback(
-                "fixtures/matches.json?team_id=" + teamId);
+        Map<String, Object> result = callWithFallback("fixtures/matches.json?team_id=" + teamId);
         if (result == null) return Collections.emptyList();
-        return extractMatchList(result, "data", "fixture");
+        return extractFixtureList(result);
     }
 
-    // ── 5. Match Details & Statistics ─────────────────────────────────────
+    // ── Match Details ─────────────────────────────────────────────────────
 
     public Map<String, Object> getMatchStats(int matchId) {
         Map<String, Object> result = callWithFallback("matches/stats.json?match_id=" + matchId);
@@ -459,7 +438,7 @@ public class LiveScoreApiClient {
         return Collections.unmodifiableMap(details);
     }
 
-    // ── 6. Standings ──────────────────────────────────────────────────────
+    // ── Standings ─────────────────────────────────────────────────────────
 
     public Map<String, Object> getStandings(int competitionId) {
         return cached("standings:" + competitionId, () -> {
@@ -470,8 +449,7 @@ public class LiveScoreApiClient {
     }
 
     public Map<String, Object> getLiveStandings(int competitionId) {
-        Map<String, Object> result = callWithFallback(
-                "standings/live.json?competition_id=" + competitionId);
+        Map<String, Object> result = callWithFallback("standings/live.json?competition_id=" + competitionId);
         return result != null ? result : Map.of();
     }
 
@@ -480,16 +458,14 @@ public class LiveScoreApiClient {
             Map<String, Map<String, Object>> all = new LinkedHashMap<>();
             for (Map.Entry<String, Integer> entry : TOP_6_COMPETITION_IDS.entrySet()) {
                 Map<String, Object> standings = getStandings(entry.getValue());
-                if (standings != null && !standings.isEmpty()) {
-                    all.put(entry.getKey(), standings);
-                }
+                if (standings != null && !standings.isEmpty()) all.put(entry.getKey(), standings);
                 sleepQuietly(200);
             }
             return all;
         });
     }
 
-    // ── 7. Competitions & Leagues ─────────────────────────────────────────
+    // ── Competitions ──────────────────────────────────────────────────────
 
     public Map<String, Object> getAllCompetitions() {
         return cached("competitions:all", () -> {
@@ -500,18 +476,16 @@ public class LiveScoreApiClient {
 
     public Map<String, Object> getCompetitionsByCountry(int countryId) {
         return cached("competitions:country:" + countryId, () -> {
-            Map<String, Object> result = callWithFallback(
-                    "competitions/list.json?country_id=" + countryId);
+            Map<String, Object> result = callWithFallback("competitions/list.json?country_id=" + countryId);
             return result != null ? result : Map.of();
         });
     }
 
-    // ── 8. Teams ──────────────────────────────────────────────────────────
+    // ── Teams ─────────────────────────────────────────────────────────────
 
     public Map<String, Object> getTeamsByCompetition(int competitionId) {
         return cached("teams:comp:" + competitionId, () -> {
-            Map<String, Object> result = callWithFallback(
-                    "teams/list.json?competition_id=" + competitionId);
+            Map<String, Object> result = callWithFallback("teams/list.json?competition_id=" + competitionId);
             return result != null ? result : Map.of();
         });
     }
@@ -527,7 +501,7 @@ public class LiveScoreApiClient {
         return result != null ? result : Map.of();
     }
 
-    // ── 9. Top Scorers & Disciplinary ─────────────────────────────────────
+    // ── Top Scorers & Disciplinary ────────────────────────────────────────
 
     public Map<String, Object> getTopScorers(int competitionId) {
         return cached("topscorers:" + competitionId, () -> {
@@ -545,7 +519,7 @@ public class LiveScoreApiClient {
         });
     }
 
-    // ── 10. Countries & Seasons ───────────────────────────────────────────
+    // ── Countries & Seasons ───────────────────────────────────────────────
 
     public Map<String, Object> getCountries() {
         return cached("countries:all", () -> {
@@ -561,39 +535,20 @@ public class LiveScoreApiClient {
         });
     }
 
-    // ── 11. Odds (embedded in match responses) ────────────────────────────
+    // ── Odds helpers ──────────────────────────────────────────────────────
 
     public Map<String, Object> extractOdds(Map<String, Object> matchData) {
         Object odds = matchData.get("odds");
-        if (odds instanceof Map<?, ?> oddsMap) {
-            return new HashMap<>((Map<String, Object>) oddsMap);
-        }
+        if (odds instanceof Map<?, ?> oddsMap) return new HashMap<>((Map<String, Object>) oddsMap);
         return Map.of();
     }
 
-    public String extractPreOddsHome(Map<String, Object> matchData) {
-        return extractNestedOdds(matchData, "pre", "1");
-    }
-
-    public String extractPreOddsDraw(Map<String, Object> matchData) {
-        return extractNestedOdds(matchData, "pre", "X");
-    }
-
-    public String extractPreOddsAway(Map<String, Object> matchData) {
-        return extractNestedOdds(matchData, "pre", "2");
-    }
-
-    public String extractLiveOddsHome(Map<String, Object> matchData) {
-        return extractNestedOdds(matchData, "live", "1");
-    }
-
-    public String extractLiveOddsDraw(Map<String, Object> matchData) {
-        return extractNestedOdds(matchData, "live", "X");
-    }
-
-    public String extractLiveOddsAway(Map<String, Object> matchData) {
-        return extractNestedOdds(matchData, "live", "2");
-    }
+    public String extractPreOddsHome(Map<String, Object> m)  { return extractNestedOdds(m, "pre",  "1"); }
+    public String extractPreOddsDraw(Map<String, Object> m)  { return extractNestedOdds(m, "pre",  "X"); }
+    public String extractPreOddsAway(Map<String, Object> m)  { return extractNestedOdds(m, "pre",  "2"); }
+    public String extractLiveOddsHome(Map<String, Object> m) { return extractNestedOdds(m, "live", "1"); }
+    public String extractLiveOddsDraw(Map<String, Object> m) { return extractNestedOdds(m, "live", "X"); }
+    public String extractLiveOddsAway(Map<String, Object> m) { return extractNestedOdds(m, "live", "2"); }
 
     @SuppressWarnings("unchecked")
     private String extractNestedOdds(Map<String, Object> matchData, String type, String outcome) {
@@ -610,34 +565,55 @@ public class LiveScoreApiClient {
         return "";
     }
 
-    // ── 12. Field extraction helpers ──────────────────────────────────────
+    // ═════════════════════════════════════════════════════════════════════
+    //  FIELD EXTRACTION — handle BOTH response shapes
+    // ═════════════════════════════════════════════════════════════════════
 
     public static String extractMatchId(Map<String, Object> match) {
         Object v = match.get("id");
         return v != null ? v.toString() : "";
     }
 
+    /**
+     * Fixture identifier.
+     * Competition-specific: "fixture_id"
+     * General endpoint:     "id" (no fixture_id field)
+     */
     public static String extractFixtureId(Map<String, Object> match) {
-        Object v = match.get("fixture_id");
-        return v != null ? v.toString() : "";
+        Object fixtureId = match.get("fixture_id");
+        if (fixtureId != null && !fixtureId.toString().isBlank()) return fixtureId.toString();
+        Object id = match.get("id");
+        return id != null ? id.toString() : "";
     }
 
+    /**
+     * Home team name.
+     * Competition-specific: home.name (nested)
+     * General endpoint:     home_name (flat)
+     */
     public static String extractHomeName(Map<String, Object> match) {
         Object home = match.get("home");
         if (home instanceof Map<?, ?> homeMap) {
             Object name = ((Map<?, ?>) homeMap).get("name");
-            if (name != null) return name.toString();
+            if (name != null && !name.toString().isBlank()) return name.toString();
         }
-        return "";
+        Object flat = match.get("home_name");
+        return flat != null ? flat.toString() : "";
     }
 
+    /**
+     * Away team name.
+     * Competition-specific: away.name (nested)
+     * General endpoint:     away_name (flat)
+     */
     public static String extractAwayName(Map<String, Object> match) {
         Object away = match.get("away");
         if (away instanceof Map<?, ?> awayMap) {
             Object name = ((Map<?, ?>) awayMap).get("name");
-            if (name != null) return name.toString();
+            if (name != null && !name.toString().isBlank()) return name.toString();
         }
-        return "";
+        Object flat = match.get("away_name");
+        return flat != null ? flat.toString() : "";
     }
 
     public static String extractHomeLogo(Map<String, Object> match) {
@@ -662,10 +638,7 @@ public class LiveScoreApiClient {
         Object scores = match.get("scores");
         if (scores instanceof Map<?, ?> scoresMap) {
             Object score = ((Map<?, ?>) scoresMap).get("score");
-            if (score != null) {
-                // Normalise "2 - 0" → "2-0" for consistent downstream parsing
-                return score.toString().replace(" ", "");
-            }
+            if (score != null) return score.toString().replace(" ", "");
         }
         return "-";
     }
@@ -674,9 +647,7 @@ public class LiveScoreApiClient {
         Object scores = match.get("scores");
         if (scores instanceof Map<?, ?> scoresMap) {
             Object ht = ((Map<?, ?>) scoresMap).get("ht_score");
-            if (ht != null) {
-                return ht.toString().replace(" ", "");
-            }
+            if (ht != null) return ht.toString().replace(" ", "");
         }
         return "";
     }
@@ -686,51 +657,89 @@ public class LiveScoreApiClient {
         return status != null ? status.toString() : "";
     }
 
+    /**
+     * Match clock / status string (e.g. "45", "FT", "HT").
+     * NOTE: on the general endpoint the "time" field holds the kickoff time
+     * (e.g. "10:00:00"), not the match clock. Use this only for live match data.
+     */
     public static String extractMatchTime(Map<String, Object> match) {
         Object time = match.get("time");
         return time != null ? time.toString() : "";
     }
 
-    /**
-     * Returns the match date field (e.g. "2026-05-01") from the API response.
-     * Used together with extractScheduledTime to build a full kickoff Instant.
-     */
     public static String extractMatchDate(Map<String, Object> match) {
         Object date = match.get("date");
         return date != null ? date.toString() : "";
     }
 
     /**
-     * Returns the scheduled time field (e.g. "05:00") from the API response.
-     * This is a bare HH:mm string — combine with extractMatchDate to get a full
-     * kickoff timestamp via buildKickoffInstant().
+     * Raw scheduled/kickoff time string.
+     * Competition-specific: "scheduled" (ISO datetime or HH:mm)
+     * General endpoint:     "time"      (HH:mm:ss)
      */
     public static String extractScheduledTime(Map<String, Object> match) {
         Object scheduled = match.get("scheduled");
-        return scheduled != null ? scheduled.toString() : "";
+        if (scheduled != null && !scheduled.toString().isBlank()) return scheduled.toString();
+        Object time = match.get("time");
+        return time != null ? time.toString() : "";
     }
 
     /**
-     * Combines the match date ("2026-05-01") and scheduled time ("05:00") fields
-     * into an Instant at UTC. Returns null if either field is missing or unparseable.
+     * Builds a UTC Instant for kickoff — handles both API response shapes.
      *
-     * This is the correct way to get kickoff time from history/fixture responses
-     * because the API returns date and time as separate fields, not a combined ISO string.
+     * Shape 1 — Competition-specific (fixtures/matches.json?competition_id=X):
+     *   "scheduled": "2026-05-01T10:00:00"  → parsed as LocalDateTime UTC
+     *   "scheduled": "10:00"                 → combined with "date" field
+     *
+     * Shape 2 — General (fixtures/matches.json, no competition_id):
+     *   "date": "2026-05-01"  +  "time": "10:00:00"  → combined as UTC Instant
+     *
+     * Returns null if required fields are missing or unparseable.
      */
     public static Instant buildKickoffInstant(Map<String, Object> match) {
-        String date      = extractMatchDate(match);
-        String scheduled = extractScheduledTime(match);
-        if (date.isBlank() || scheduled.isBlank()) return null;
+
+        // ── Shape 1: "scheduled" field (competition-specific endpoint) ────
+        Object scheduledObj = match.get("scheduled");
+        if (scheduledObj != null && !scheduledObj.toString().isBlank()) {
+            String scheduled = scheduledObj.toString();
+            // Full ISO datetime e.g. "2026-05-01T10:00:00"
+            if (scheduled.contains("T")) {
+                try { return LocalDateTime.parse(scheduled).toInstant(ZoneOffset.UTC); }
+                catch (DateTimeParseException ignored) {}
+                try { return OffsetDateTime.parse(scheduled).toInstant(); }
+                catch (DateTimeParseException ignored) {}
+            }
+            // Bare "HH:mm" — fall through to combine with date below
+        }
+
+        // ── Shape 2: "date" + "time" fields (general endpoint) ───────────
+        String date    = extractMatchDate(match);
+        String timeStr = "";
+
+        // General endpoint: "time" field holds kickoff time e.g. "10:00:00"
+        Object timeObj = match.get("time");
+        if (timeObj != null && !timeObj.toString().isBlank()) {
+            timeStr = timeObj.toString();
+        } else if (scheduledObj != null && !scheduledObj.toString().isBlank()) {
+            // Bare HH:mm from "scheduled" field
+            timeStr = scheduledObj.toString();
+        }
+
+        if (date.isBlank() || timeStr.isBlank()) {
+            log.debug("buildKickoffInstant: missing date='{}' or time='{}' — cannot build Instant", date, timeStr);
+            return null;
+        }
+
         try {
-            // scheduled is "HH:mm" — parse it and combine with date at UTC
-            LocalDate  ld = LocalDate.parse(date, DateTimeFormatter.ISO_LOCAL_DATE);
-            LocalTime  lt = LocalTime.parse(scheduled.length() == 5
-                            ? scheduled          // "05:00"
-                            : scheduled + ":00", // just in case it's "5:00" without leading zero
-                    DateTimeFormatter.ofPattern("HH:mm"));
-            return LocalDateTime.of(ld, lt).toInstant(ZoneOffset.UTC);
+            LocalDate ld   = LocalDate.parse(date, DateTimeFormatter.ISO_LOCAL_DATE);
+            // Normalise to HH:mm — handles "10:00:00" and "10:00" both
+            String    hhmm = timeStr.length() >= 5 ? timeStr.substring(0, 5) : timeStr;
+            LocalTime lt   = LocalTime.parse(hhmm, DateTimeFormatter.ofPattern("HH:mm"));
+            Instant kickoff = LocalDateTime.of(ld, lt).toInstant(ZoneOffset.UTC);
+            log.debug("buildKickoffInstant: date='{}' time='{}' → {}", date, timeStr, kickoff);
+            return kickoff;
         } catch (DateTimeParseException e) {
-            log.debug("buildKickoffInstant: could not parse date='{}' scheduled='{}'", date, scheduled);
+            log.debug("buildKickoffInstant: could not parse date='{}' time='{}'", date, timeStr);
             return null;
         }
     }
@@ -745,11 +754,10 @@ public class LiveScoreApiClient {
     }
 
     public static boolean isLive(Map<String, Object> match) {
-        String time   = extractMatchTime(match);
         String status = extractStatus(match);
+        String time   = extractMatchTime(match);
         return "LIVE".equalsIgnoreCase(status) ||
-                (!time.isEmpty() && !"FT".equals(time) && !"HT".equals(time)
-                        && !time.isEmpty() && !"POSTP".equals(time));
+                (!time.isEmpty() && !"FT".equals(time) && !"HT".equals(time) && !"POSTP".equals(time));
     }
 
     public static boolean isFinished(Map<String, Object> match) {
@@ -763,7 +771,7 @@ public class LiveScoreApiClient {
         return "SCHEDULED".equalsIgnoreCase(status) || status.isEmpty();
     }
 
-    // ── Key status (debugging) ────────────────────────────────────────────
+    // ── Key status ────────────────────────────────────────────────────────
 
     public Map<String, Object> getKeyStatus() {
         Map<String, Object> status = new LinkedHashMap<>();
@@ -771,33 +779,51 @@ public class LiveScoreApiClient {
         for (String[] cred : apiCredentials) {
             String key  = cred[0];
             Long until  = keyCooldowns.get(key);
-            String tail = tail(key);
-            if (until == null || now >= until) {
-                status.put("..." + tail, "ACTIVE");
-            } else {
-                long secondsLeft = (until - now) / 1000;
-                status.put("..." + tail, "COOLDOWN (" + secondsLeft + "s remaining)");
-            }
+            if (until == null || now >= until) status.put("..." + tail(key), "ACTIVE");
+            else status.put("..." + tail(key), "COOLDOWN (" + (until - now) / 1000 + "s remaining)");
         }
         return status;
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
 
+    /**
+     * Extracts fixture list from general endpoint response.
+     * General:              data.fixtures  (list key "fixtures")
+     * Competition-specific: data.fixture   (list key "fixture")
+     */
     @SuppressWarnings("unchecked")
-    private List<Map<String, Object>> extractMatchList(Map<String, Object> response,
-                                                       String... keys) {
+    private List<Map<String, Object>> extractFixtureList(Map<String, Object> response) {
+        if (response == null) return Collections.emptyList();
+        Object data = response.get("data");
+        if (data instanceof Map<?, ?> dataMap) {
+            // General endpoint key
+            Object fixtures = ((Map<?, ?>) dataMap).get("fixtures");
+            if (fixtures instanceof List<?> list && !list.isEmpty()) {
+                log.debug("extractFixtureList: {} fixtures via data.fixtures", list.size());
+                return (List<Map<String, Object>>) list;
+            }
+            // Competition-specific endpoint key (fallback)
+            Object fixture = ((Map<?, ?>) dataMap).get("fixture");
+            if (fixture instanceof List<?> list && !list.isEmpty()) {
+                log.debug("extractFixtureList: {} fixtures via data.fixture", list.size());
+                return (List<Map<String, Object>>) list;
+            }
+        }
+        // Last resort
+        return extractMatchList(response, "fixtures", "fixture");
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> extractMatchList(Map<String, Object> response, String... keys) {
         if (response == null) return Collections.emptyList();
         for (String key : keys) {
             Object val = response.get(key);
-            if (val instanceof List<?> list && !list.isEmpty()) {
-                return (List<Map<String, Object>>) list;
-            }
+            if (val instanceof List<?> list && !list.isEmpty()) return (List<Map<String, Object>>) list;
             if (val instanceof Map<?, ?> nested) {
                 for (Object innerVal : ((Map<?, ?>) nested).values()) {
-                    if (innerVal instanceof List<?> innerList && !innerList.isEmpty()) {
+                    if (innerVal instanceof List<?> innerList && !innerList.isEmpty())
                         return (List<Map<String, Object>>) innerList;
-                    }
                 }
             }
         }
@@ -807,15 +833,13 @@ public class LiveScoreApiClient {
     private int extractStatusCode(Throwable e) {
         String msg = e.getMessage();
         if (msg == null) return 0;
-        try {
-            if (msg.contains("401")) return 401;
-            if (msg.contains("403")) return 403;
-            if (msg.contains("402")) return 402;
-            if (msg.contains("429")) return 429;
-            if (msg.contains("500")) return 500;
-            if (msg.contains("502")) return 502;
-            if (msg.contains("503")) return 503;
-        } catch (Exception ignored) {}
+        if (msg.contains("401")) return 401;
+        if (msg.contains("403")) return 403;
+        if (msg.contains("402")) return 402;
+        if (msg.contains("429")) return 429;
+        if (msg.contains("500")) return 500;
+        if (msg.contains("502")) return 502;
+        if (msg.contains("503")) return 503;
         return 0;
     }
 
@@ -824,12 +848,8 @@ public class LiveScoreApiClient {
     }
 
     private static void sleepQuietly(long ms) {
-        try { Thread.sleep(ms); } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-        }
+        try { Thread.sleep(ms); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
-
-    // ── Exception types ───────────────────────────────────────────────────
 
     private static class SkipKeyException extends RuntimeException {
         SkipKeyException(String msg) { super(msg); }

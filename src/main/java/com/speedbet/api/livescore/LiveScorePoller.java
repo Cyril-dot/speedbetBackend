@@ -26,7 +26,7 @@ import java.util.Map;
  *   • Today's fixtures  — every  15min
  *   • Upcoming (7 days) — every   1h
  *   • Stale LIVE sweep  — every  10min
- *   • Live odds refresh — every   2min  (cache + DB)
+ *   • Live odds refresh — every   2min
  */
 @Slf4j
 @Component
@@ -48,36 +48,31 @@ public class LiveScorePoller {
         try {
             List<Map<String, Object>> lsLive = liveScoreApiClient.getLiveScores();
             if (lsLive == null || lsLive.isEmpty()) {
-                log.info("Live poll [LiveScoreApi]: no live scores returned.");
+                log.info("Live poll: no live scores returned.");
             } else {
-                log.info("Live poll [LiveScoreApi]: {} live matches received.", lsLive.size());
+                log.info("Live poll: {} live matches received.", lsLive.size());
                 int updated = 0, skipped = 0;
                 for (Map<String, Object> event : lsLive) {
                     try {
                         Match m = mapLiveScoreApiMatchToMatch(event, true);
-                        if (m != null) {
-                            matchService.saveOrUpdate(m);
-                            updated++;
-                        } else {
-                            skipped++;
-                        }
+                        if (m != null) { matchService.saveOrUpdate(m); updated++; }
+                        else skipped++;
                     } catch (Exception e) {
                         skipped++;
                         log.warn("Live poll: failed event id={} — {}",
                                 LiveScoreApiClient.extractMatchId(event), e.getMessage());
                     }
                 }
-                log.info("Live poll [LiveScoreApi]: done — updated={}, skipped={}.", updated, skipped);
+                log.info("Live poll: done — updated={}, skipped={}.", updated, skipped);
             }
         } catch (Exception e) {
-            log.error("Live poll [LiveScoreApi]: top-level error — {}", e.getMessage(), e);
+            log.error("Live poll: top-level error — {}", e.getMessage(), e);
         }
         log.debug("=== Live score poll complete ===");
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     // 2. TODAY'S FIXTURES — every 15 minutes
-    //    Saves pre-match odds for any newly persisted fixture.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 15 * 60_000L, initialDelay = 10_000L)
@@ -105,9 +100,7 @@ public class LiveScorePoller {
                                 }
                             }
                             saved++;
-                        } else {
-                            skipped++;
-                        }
+                        } else skipped++;
                     } catch (Exception e) {
                         skipped++;
                         log.warn("Today poll: failed event id={} — {}",
@@ -125,33 +118,53 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 3. UPCOMING FIXTURES (next 7 days) — every hour
-    //    Saves pre-match odds for each fixture so bets can be placed.
+    //
+    //    Strategy:
+    //    a) Try top-6 leagues via competition-specific endpoint first
+    //       (nested home.name/away.name + "scheduled" ISO field)
+    //    b) If top-6 returns nothing, fall back to general endpoint
+    //       (flat home_name/away_name + "date"+"time" fields)
+    //    Both shapes are handled by the extractor methods.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 60 * 60_000L, initialDelay = 30_000L)
     public void pollUpcomingFixtures() {
         log.info("=== Upcoming fixtures poll starting ===");
         try {
+            // Primary: top-6 leagues (competition-specific endpoint)
             List<Map<String, Object>> fixtures = liveScoreApiClient.getTop6Fixtures();
+
+            // Fallback: general endpoint if top-6 is empty
             if (fixtures == null || fixtures.isEmpty()) {
-                log.info("Upcoming poll: no top-6 fixtures returned.");
+                log.info("Upcoming poll: top-6 returned no fixtures, trying general endpoint...");
+                fixtures = liveScoreApiClient.getUpcomingFixtures();
+            }
+
+            if (fixtures == null || fixtures.isEmpty()) {
+                log.info("Upcoming poll: no fixtures returned from any endpoint.");
             } else {
+                log.info("Upcoming poll: {} fixtures to process.", fixtures.size());
                 int saved = 0, skipped = 0;
                 for (Map<String, Object> event : fixtures) {
                     try {
                         Match m = mapLiveScoreApiFixtureToMatch(event);
                         if (m != null) {
-                            Match persisted = matchService.saveOrUpdate(m);
-                            try {
-                                oddsPersistenceService.generateAndSaveAllOdds(persisted);
-                            } catch (Exception oe) {
-                                log.warn("Upcoming poll: odds save failed matchId={} — {}",
-                                        persisted.getId(), oe.getMessage());
+                            // Only persist if kickoff is in the future
+                            if (m.getKickoffAt() != null && m.getKickoffAt().isAfter(Instant.now())) {
+                                Match persisted = matchService.saveOrUpdate(m);
+                                try {
+                                    oddsPersistenceService.generateAndSaveAllOdds(persisted);
+                                } catch (Exception oe) {
+                                    log.warn("Upcoming poll: odds save failed matchId={} — {}",
+                                            persisted.getId(), oe.getMessage());
+                                }
+                                saved++;
+                            } else {
+                                log.debug("Upcoming poll: skipping past/null kickoff for externalId={}",
+                                        m.getExternalId());
+                                skipped++;
                             }
-                            saved++;
-                        } else {
-                            skipped++;
-                        }
+                        } else skipped++;
                     } catch (Exception e) {
                         skipped++;
                         log.warn("Upcoming poll: failed fixture id={} — {}",
@@ -187,8 +200,6 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 5. LIVE ODDS REFRESH — every 2 minutes
-    //    Updates both the in-memory cache (for fast reads) AND the DB
-    //    (so BetService can resolve odds at bet placement time).
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 2 * 60_000L, initialDelay = 15_000L)
@@ -200,8 +211,7 @@ public class LiveScorePoller {
                 log.debug("Live odds refresh: no live matches, skipping.");
                 return;
             }
-            log.info("Live odds refresh: regenerating odds for {} live match(es).", liveMatches.size());
-
+            log.info("Live odds refresh: {} live match(es).", liveMatches.size());
             matchService.refreshLiveOddsCache(liveMatches);
 
             int persisted = 0, failed = 0;
@@ -215,9 +225,7 @@ public class LiveScorePoller {
                             match.getId(), e.getMessage());
                 }
             }
-            log.info("Live odds refresh: DB persisted={}/{} failed={}",
-                    persisted, liveMatches.size(), failed);
-
+            log.info("Live odds refresh: persisted={}/{} failed={}", persisted, liveMatches.size(), failed);
         } catch (Exception e) {
             log.warn("Live odds refresh: error — {}", e.getMessage());
         }
@@ -228,23 +236,15 @@ public class LiveScorePoller {
     // CACHE HELPERS
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Clears all match-related Spring caches in one shot after a bulk poll
-     * completes. Logs each cache name and found status so mismatches are
-     * immediately visible in production logs.
-     */
     private void evictMatchCaches() {
         List<String> names = List.of("matches", "todayMatches", "futureMatches", "featuredMatches");
         int cleared = 0;
         for (String name : names) {
             Cache cache = cacheManager.getCache(name);
             log.info("evictMatchCaches: cache='{}' found={}", name, cache != null);
-            if (cache != null) {
-                cache.clear();
-                cleared++;
-            }
+            if (cache != null) { cache.clear(); cleared++; }
         }
-        log.info("evictMatchCaches: done — {}/{} caches cleared.", cleared, names.size());
+        log.info("evictMatchCaches: {}/{} caches cleared.", cleared, names.size());
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -278,7 +278,6 @@ public class LiveScorePoller {
         match.setAwayLogo(LiveScoreApiClient.extractAwayLogo(event));
         match.setLeague(LiveScoreApiClient.extractCompetitionName(event));
 
-        // Score — API returns "2 - 0"; extractScore normalises spaces out to "2-0"
         String scoreStr = LiveScoreApiClient.extractScore(event);
         if (scoreStr != null && scoreStr.contains("-")) {
             String[] parts = scoreStr.split("-");
@@ -288,15 +287,12 @@ public class LiveScorePoller {
             }
         }
 
-        // Kickoff — API gives date ("2026-05-01") and scheduled ("05:00") as separate fields.
-        // buildKickoffInstant combines them into a UTC Instant correctly.
         Instant kickoff = LiveScoreApiClient.buildKickoffInstant(event);
         if (kickoff == null && "LIVE".equals(match.getStatus())) {
             kickoff = Instant.now().minus(45, ChronoUnit.MINUTES);
         }
         match.setKickoffAt(kickoff);
 
-        // Half-time scores → metadata (required for half_time bet settlement)
         String htScore = LiveScoreApiClient.extractHalfTimeScore(event);
         if (htScore != null && htScore.contains("-")) {
             String[] htParts = htScore.split("-");
@@ -305,16 +301,11 @@ public class LiveScorePoller {
                     int htHome = Integer.parseInt(htParts[0].trim());
                     int htAway = Integer.parseInt(htParts[1].trim());
                     Map<String, Object> meta = match.getMetadata() != null
-                            ? new HashMap<>(match.getMetadata())
-                            : new HashMap<>();
+                            ? new HashMap<>(match.getMetadata()) : new HashMap<>();
                     meta.put("score_home_ht", htHome);
                     meta.put("score_away_ht", htAway);
                     match.setMetadata(meta);
-                    log.debug("mapLiveScoreApiMatchToMatch: externalId={} ht_score={}-{}",
-                            externalId, htHome, htAway);
-                } catch (NumberFormatException ignored) {
-                    log.debug("mapLiveScoreApiMatchToMatch: could not parse ht_score '{}'", htScore);
-                }
+                } catch (NumberFormatException ignored) {}
             }
         }
 
@@ -324,26 +315,44 @@ public class LiveScorePoller {
     private Match mapLiveScoreApiFixtureToMatch(Map<String, Object> event) {
         if (event == null) return null;
 
+        // extractFixtureId handles both "fixture_id" (competition-specific)
+        // and "id" (general endpoint) — whichever is present
         String externalId = LiveScoreApiClient.extractFixtureId(event);
-        if (externalId == null || externalId.isBlank()) {
-            externalId = LiveScoreApiClient.extractMatchId(event);
-        }
         if (externalId == null || externalId.isBlank()) return null;
+
+        String homeName = LiveScoreApiClient.extractHomeName(event);
+        String awayName = LiveScoreApiClient.extractAwayName(event);
+
+        // Skip if team names are blank — indicates a malformed response row
+        if (homeName.isBlank() || awayName.isBlank()) {
+            log.debug("mapLiveScoreApiFixtureToMatch: blank team names for id={}, skipping", externalId);
+            return null;
+        }
 
         Match match = new Match();
         match.setExternalId("ls-" + externalId);
         match.setSource(MatchSource.LIVESCORE);
         match.setSport("football");
         match.setStatus("UPCOMING");
-
-        match.setHomeTeam(LiveScoreApiClient.extractHomeName(event));
-        match.setAwayTeam(LiveScoreApiClient.extractAwayName(event));
+        match.setHomeTeam(homeName);
+        match.setAwayTeam(awayName);
         match.setHomeLogo(LiveScoreApiClient.extractHomeLogo(event));
         match.setAwayLogo(LiveScoreApiClient.extractAwayLogo(event));
         match.setLeague(LiveScoreApiClient.extractCompetitionName(event));
 
-        // Kickoff — combine date + scheduled time fields into a UTC Instant
-        match.setKickoffAt(LiveScoreApiClient.buildKickoffInstant(event));
+        // buildKickoffInstant handles both:
+        //  - competition-specific: "scheduled" ISO datetime
+        //  - general endpoint:     "date" + "time" fields
+        Instant kickoff = LiveScoreApiClient.buildKickoffInstant(event);
+        match.setKickoffAt(kickoff);
+
+        if (kickoff != null) {
+            log.debug("mapLiveScoreApiFixtureToMatch: id={} {} vs {} kickoff={}",
+                    externalId, homeName, awayName, kickoff);
+        } else {
+            log.warn("mapLiveScoreApiFixtureToMatch: id={} {} vs {} — could not parse kickoff",
+                    externalId, homeName, awayName);
+        }
 
         return match;
     }
