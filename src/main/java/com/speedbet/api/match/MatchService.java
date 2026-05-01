@@ -47,6 +47,11 @@ public class MatchService {
         boolean isValid() { return System.currentTimeMillis() <= expiresAt; }
     }
 
+    // ── Helper: treat null AND empty string as "missing" ─────────────────
+    private static boolean isMissing(String val) {
+        return val == null || val.isBlank();
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // INTERNAL HELPERS
     // ══════════════════════════════════════════════════════════════════════
@@ -82,15 +87,6 @@ public class MatchService {
 
     /**
      * Exposes the live odds cache to BetService for odds resolution at bet-placement time.
-     *
-     * Used as a fallback when the DB has no odds row for a LIVE match — this happens when:
-     *   a) The match was already live when the server started (generateAndSaveAllOdds only
-     *      runs for UPCOMING fixtures, so no DB rows were ever written).
-     *   b) The 2-minute live-odds DB write cycle hasn't run yet since the match went live.
-     *
-     * @param matchId  the match UUID
-     * @param market   normalised market key — "1X2" or "asian_handicap"
-     * @return the cached odds list, or null if the cache is absent or expired
      */
     public List<Map<String, Object>> getOddsFromCache(UUID matchId, String market) {
         return switch (market) {
@@ -491,6 +487,16 @@ public class MatchService {
 
     // ══════════════════════════════════════════════════════════════════════
     // PERSISTENCE
+    //
+    // FIX: saveOrUpdate previously used `existing.getHomeTeam() == null`
+    // to decide whether to fill in team names. The upcoming fixture poller
+    // was saving rows with homeTeam="" (empty string, not null) so the
+    // null-check never fired and names were never backfilled.
+    //
+    // Changed all "fill if null" guards to isMissing() which treats both
+    // null AND empty/blank strings as "needs to be filled in". This means:
+    //   - A fresh row with homeTeam="" will be updated with the real name.
+    //   - A row that already has a real name ("Arsenal") will not be overwritten.
     // ══════════════════════════════════════════════════════════════════════
 
     @Transactional
@@ -501,22 +507,32 @@ public class MatchService {
 
         return matchRepo.findByExternalId(match.getExternalId())
                 .map(existing -> {
+                    // Always overwrite mutable state fields
                     if (match.getStatus()    != null) existing.setStatus(match.getStatus());
                     if (match.getScoreHome() != null) existing.setScoreHome(match.getScoreHome());
                     if (match.getScoreAway() != null) existing.setScoreAway(match.getScoreAway());
                     if (match.getMetadata()  != null) existing.setMetadata(match.getMetadata());
-                    if (existing.getHomeTeam()   == null && match.getHomeTeam()   != null) existing.setHomeTeam(match.getHomeTeam());
-                    if (existing.getAwayTeam()   == null && match.getAwayTeam()   != null) existing.setAwayTeam(match.getAwayTeam());
-                    if (existing.getLeague()     == null && match.getLeague()     != null) existing.setLeague(match.getLeague());
-                    if (existing.getSport()      == null && match.getSport()      != null) existing.setSport(match.getSport());
-                    if (existing.getHomeLogo()   == null && match.getHomeLogo()   != null) existing.setHomeLogo(match.getHomeLogo());
-                    if (existing.getAwayLogo()   == null && match.getAwayLogo()   != null) existing.setAwayLogo(match.getAwayLogo());
-                    if (existing.getLeagueLogo() == null && match.getLeagueLogo() != null) existing.setLeagueLogo(match.getLeagueLogo());
+
+                    // FIX: use isMissing() so empty strings are overwritten too
+                    if (isMissing(existing.getHomeTeam())   && !isMissing(match.getHomeTeam()))   existing.setHomeTeam(match.getHomeTeam());
+                    if (isMissing(existing.getAwayTeam())   && !isMissing(match.getAwayTeam()))   existing.setAwayTeam(match.getAwayTeam());
+                    if (isMissing(existing.getLeague())     && !isMissing(match.getLeague()))     existing.setLeague(match.getLeague());
+                    if (isMissing(existing.getSport())      && !isMissing(match.getSport()))      existing.setSport(match.getSport());
+                    if (isMissing(existing.getHomeLogo())   && !isMissing(match.getHomeLogo()))   existing.setHomeLogo(match.getHomeLogo());
+                    if (isMissing(existing.getAwayLogo())   && !isMissing(match.getAwayLogo()))   existing.setAwayLogo(match.getAwayLogo());
+                    if (isMissing(existing.getLeagueLogo()) && !isMissing(match.getLeagueLogo())) existing.setLeagueLogo(match.getLeagueLogo());
                     if (existing.getKickoffAt()  == null && match.getKickoffAt()  != null) existing.setKickoffAt(match.getKickoffAt());
                     if (existing.getSource()     == null && match.getSource()     != null) existing.setSource(match.getSource());
+
+                    log.debug("saveOrUpdate: updated externalId={} home='{}' away='{}'",
+                            existing.getExternalId(), existing.getHomeTeam(), existing.getAwayTeam());
                     return matchRepo.save(existing);
                 })
-                .orElseGet(() -> matchRepo.save(match));
+                .orElseGet(() -> {
+                    log.debug("saveOrUpdate: inserting new externalId={} home='{}' away='{}'",
+                            match.getExternalId(), match.getHomeTeam(), match.getAwayTeam());
+                    return matchRepo.save(match);
+                });
     }
 
     @Transactional

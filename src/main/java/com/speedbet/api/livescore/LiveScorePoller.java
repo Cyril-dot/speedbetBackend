@@ -24,7 +24,7 @@ import java.util.Map;
  * Schedules:
  *   • Live scores       — every  30s
  *   • Today's fixtures  — every  15min
- *   • Upcoming (7 days) — every   1h
+ *   • Upcoming (7 days) — every   1h   ← uses general endpoint (all leagues)
  *   • Stale LIVE sweep  — every  10min
  *   • Live odds refresh — every   2min
  */
@@ -119,29 +119,26 @@ public class LiveScorePoller {
     // ═══════════════════════════════════════════════════════════════════════
     // 3. UPCOMING FIXTURES (next 7 days) — every hour
     //
-    //    Strategy:
-    //    a) Try top-6 leagues via competition-specific endpoint first
-    //       (nested home.name/away.name + "scheduled" ISO field)
-    //    b) If top-6 returns nothing, fall back to general endpoint
-    //       (flat home_name/away_name + "date"+"time" fields)
-    //    Both shapes are handled by the extractor methods.
+    //    Uses the GENERAL endpoint (fixtures/matches.json) which returns
+    //    ALL leagues with flat home_name/away_name fields.
+    //
+    //    FIX: removed the top-6 competition-specific strategy entirely.
+    //    The top-6 endpoint returns nested home.name/away.name but its
+    //    rows were being saved with empty homeTeam/awayTeam strings when
+    //    the match already existed in the DB (saveOrUpdate only fills nulls,
+    //    not empty strings). The general endpoint populates home_name /
+    //    away_name which extractHomeName/extractAwayName already handles,
+    //    and covers all leagues — not just top 6.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 60 * 60_000L, initialDelay = 30_000L)
     public void pollUpcomingFixtures() {
-        log.info("=== Upcoming fixtures poll starting ===");
+        log.info("=== Upcoming fixtures poll starting (general endpoint) ===");
         try {
-            // Primary: top-6 leagues (competition-specific endpoint)
-            List<Map<String, Object>> fixtures = liveScoreApiClient.getTop6Fixtures();
-
-            // Fallback: general endpoint if top-6 is empty
-            if (fixtures == null || fixtures.isEmpty()) {
-                log.info("Upcoming poll: top-6 returned no fixtures, trying general endpoint...");
-                fixtures = liveScoreApiClient.getUpcomingFixtures();
-            }
+            List<Map<String, Object>> fixtures = liveScoreApiClient.getUpcomingFixtures();
 
             if (fixtures == null || fixtures.isEmpty()) {
-                log.info("Upcoming poll: no fixtures returned from any endpoint.");
+                log.info("Upcoming poll: no fixtures returned from general endpoint.");
             } else {
                 log.info("Upcoming poll: {} fixtures to process.", fixtures.size());
                 int saved = 0, skipped = 0;
@@ -149,7 +146,6 @@ public class LiveScorePoller {
                     try {
                         Match m = mapLiveScoreApiFixtureToMatch(event);
                         if (m != null) {
-                            // Only persist if kickoff is in the future
                             if (m.getKickoffAt() != null && m.getKickoffAt().isAfter(Instant.now())) {
                                 Match persisted = matchService.saveOrUpdate(m);
                                 try {
@@ -315,15 +311,12 @@ public class LiveScorePoller {
     private Match mapLiveScoreApiFixtureToMatch(Map<String, Object> event) {
         if (event == null) return null;
 
-        // extractFixtureId handles both "fixture_id" (competition-specific)
-        // and "id" (general endpoint) — whichever is present
         String externalId = LiveScoreApiClient.extractFixtureId(event);
         if (externalId == null || externalId.isBlank()) return null;
 
         String homeName = LiveScoreApiClient.extractHomeName(event);
         String awayName = LiveScoreApiClient.extractAwayName(event);
 
-        // Skip if team names are blank — indicates a malformed response row
         if (homeName.isBlank() || awayName.isBlank()) {
             log.debug("mapLiveScoreApiFixtureToMatch: blank team names for id={}, skipping", externalId);
             return null;
@@ -340,9 +333,6 @@ public class LiveScorePoller {
         match.setAwayLogo(LiveScoreApiClient.extractAwayLogo(event));
         match.setLeague(LiveScoreApiClient.extractCompetitionName(event));
 
-        // buildKickoffInstant handles both:
-        //  - competition-specific: "scheduled" ISO datetime
-        //  - general endpoint:     "date" + "time" fields
         Instant kickoff = LiveScoreApiClient.buildKickoffInstant(event);
         match.setKickoffAt(kickoff);
 
