@@ -10,8 +10,15 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.time.OffsetDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -26,23 +33,23 @@ import java.util.concurrent.*;
  * returned so the UI can handle the no-data state gracefully.
  *
  * ── Endpoints used ──────────────────────────────────────────────────────────
- *   GET /api-client/matches/live.json                     → live scores (all)
- *   GET /api-client/matches/live.json?competition_id=X    → live scores by league
- *   GET /api-client/scores/history.json?date=YYYY-MM-DD   → today/past results
- *   GET /api-client/fixtures/matches.json?date=YYYY-MM-DD → upcoming fixtures
- *   GET /api-client/matches/stats.json?match_id=X         → match statistics
- *   GET /api-client/matches/lineups.json?match_id=X       → match lineups
- *   GET /api-client/scores/events.json?id=X               → match events (goals, cards)
- *   GET /api-client/matches/commentary.json?match_id=X    → live commentary
- *   GET /api-client/standings/table.json?competition_id=X → league standings
- *   GET /api-client/standings/live.json?competition_id=X  → live standings
- *   GET /api-client/competitions/list.json                → all competitions
+ *   GET /api-client/matches/live.json                          → live scores (all)
+ *   GET /api-client/matches/live.json?competition_id=X         → live scores by league
+ *   GET /api-client/matches/history.json?from=YYYY-MM-DD&to=YYYY-MM-DD → today/past results
+ *   GET /api-client/fixtures/matches.json?competition_id=X    → upcoming fixtures
+ *   GET /api-client/matches/stats.json?match_id=X             → match statistics
+ *   GET /api-client/matches/lineups.json?match_id=X           → match lineups
+ *   GET /api-client/scores/events.json?id=X                   → match events (goals, cards)
+ *   GET /api-client/matches/commentary.json?match_id=X        → live commentary
+ *   GET /api-client/standings/table.json?competition_id=X     → league standings
+ *   GET /api-client/standings/live.json?competition_id=X      → live standings
+ *   GET /api-client/competitions/list.json                    → all competitions
  *   GET /api-client/teams/head2head.json?team1_id=X&team2_id=Y → head to head
- *   GET /api-client/teams/list.json?competition_id=X      → teams in league
- *   GET /api-client/teams/matches.json?team_id=X          → team last matches
- *   GET /api-client/countries/list.json                   → countries list
- *   GET /api-client/seasons/list.json                     → seasons list
- *   GET /api-client/users/pair.json                       → verify credentials
+ *   GET /api-client/teams/list.json?competition_id=X          → teams in league
+ *   GET /api-client/teams/matches.json?team_id=X              → team last matches
+ *   GET /api-client/countries/list.json                       → countries list
+ *   GET /api-client/seasons/list.json                         → seasons list
+ *   GET /api-client/users/pair.json                           → verify credentials
  */
 @Slf4j
 @Component
@@ -101,8 +108,9 @@ public class LiveScoreApiClient {
 
     // ── API key pairs (key + secret) ──────────────────────────────────────
     private final List<String[]> apiCredentials = List.of(
-            new String[]{"TA16A6HrD4mYThZ8",  "6QXYN60QILflOkUHUVOv2vXGzkFtBFCH"},  // Primary
-            new String[]{"nIznBfFZuqhOnB3h",   "fwDKGjvEE8Qh1XMpGmNhBsh5TyUgaXyp"}
+            new String[]{"nIznBfFZuqhOnB3h",   "fwDKGjvEE8Qh1XMpGmNhBsh5TyUgaXyp"},
+            new String[]{"TA16A6HrD4mYThZ8",  "6QXYN60QILflOkUHUVOv2vXGzkFtBFCH"} // Primary
+
     );
 
     private final WebClient    client;
@@ -325,12 +333,13 @@ public class LiveScoreApiClient {
 
     /**
      * Get all matches played or scheduled for today.
-     * Returns empty list if API is unavailable — no demo fallback.
+     * Uses matches/history.json with from+to date params (correct endpoint).
      */
     public List<Map<String, Object>> getTodayMatches() {
         String today = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
         return cached("today:" + today, () -> {
-            Map<String, Object> result = callWithFallback("scores/history.json?date=" + today);
+            Map<String, Object> result = callWithFallback(
+                    "matches/history.json?from=" + today + "&to=" + today);
             if (result == null) return Collections.emptyList();
             return extractMatchList(result, "data", "match");
         });
@@ -342,7 +351,8 @@ public class LiveScoreApiClient {
             List<Map<String, Object>> all = new ArrayList<>();
             for (Map.Entry<String, Integer> entry : TOP_6_COMPETITION_IDS.entrySet()) {
                 Map<String, Object> result = callWithFallback(
-                        "scores/history.json?date=" + today + "&competition_id=" + entry.getValue());
+                        "matches/history.json?from=" + today + "&to=" + today
+                                + "&competition_id=" + entry.getValue());
                 if (result != null) all.addAll(extractMatchList(result, "data", "match"));
                 sleepQuietly(200);
             }
@@ -350,9 +360,14 @@ public class LiveScoreApiClient {
         });
     }
 
+    /**
+     * Get matches for a specific date.
+     * Uses matches/history.json with from+to — the correct endpoint and params.
+     */
     public List<Map<String, Object>> getMatchesByDate(String date) {
         return cached("history:" + date, () -> {
-            Map<String, Object> result = callWithFallback("scores/history.json?date=" + date);
+            Map<String, Object> result = callWithFallback(
+                    "matches/history.json?from=" + date + "&to=" + date);
             if (result == null) return Collections.emptyList();
             return extractMatchList(result, "data", "match");
         });
@@ -647,7 +662,10 @@ public class LiveScoreApiClient {
         Object scores = match.get("scores");
         if (scores instanceof Map<?, ?> scoresMap) {
             Object score = ((Map<?, ?>) scoresMap).get("score");
-            if (score != null) return score.toString();
+            if (score != null) {
+                // Normalise "2 - 0" → "2-0" for consistent downstream parsing
+                return score.toString().replace(" ", "");
+            }
         }
         return "-";
     }
@@ -656,7 +674,9 @@ public class LiveScoreApiClient {
         Object scores = match.get("scores");
         if (scores instanceof Map<?, ?> scoresMap) {
             Object ht = ((Map<?, ?>) scoresMap).get("ht_score");
-            if (ht != null) return ht.toString();
+            if (ht != null) {
+                return ht.toString().replace(" ", "");
+            }
         }
         return "";
     }
@@ -671,9 +691,48 @@ public class LiveScoreApiClient {
         return time != null ? time.toString() : "";
     }
 
+    /**
+     * Returns the match date field (e.g. "2026-05-01") from the API response.
+     * Used together with extractScheduledTime to build a full kickoff Instant.
+     */
+    public static String extractMatchDate(Map<String, Object> match) {
+        Object date = match.get("date");
+        return date != null ? date.toString() : "";
+    }
+
+    /**
+     * Returns the scheduled time field (e.g. "05:00") from the API response.
+     * This is a bare HH:mm string — combine with extractMatchDate to get a full
+     * kickoff timestamp via buildKickoffInstant().
+     */
     public static String extractScheduledTime(Map<String, Object> match) {
         Object scheduled = match.get("scheduled");
         return scheduled != null ? scheduled.toString() : "";
+    }
+
+    /**
+     * Combines the match date ("2026-05-01") and scheduled time ("05:00") fields
+     * into an Instant at UTC. Returns null if either field is missing or unparseable.
+     *
+     * This is the correct way to get kickoff time from history/fixture responses
+     * because the API returns date and time as separate fields, not a combined ISO string.
+     */
+    public static Instant buildKickoffInstant(Map<String, Object> match) {
+        String date      = extractMatchDate(match);
+        String scheduled = extractScheduledTime(match);
+        if (date.isBlank() || scheduled.isBlank()) return null;
+        try {
+            // scheduled is "HH:mm" — parse it and combine with date at UTC
+            LocalDate  ld = LocalDate.parse(date, DateTimeFormatter.ISO_LOCAL_DATE);
+            LocalTime  lt = LocalTime.parse(scheduled.length() == 5
+                            ? scheduled          // "05:00"
+                            : scheduled + ":00", // just in case it's "5:00" without leading zero
+                    DateTimeFormatter.ofPattern("HH:mm"));
+            return LocalDateTime.of(ld, lt).toInstant(ZoneOffset.UTC);
+        } catch (DateTimeParseException e) {
+            log.debug("buildKickoffInstant: could not parse date='{}' scheduled='{}'", date, scheduled);
+            return null;
+        }
     }
 
     public static String extractCompetitionName(Map<String, Object> match) {

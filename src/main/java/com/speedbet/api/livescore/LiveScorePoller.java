@@ -13,9 +13,6 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
-import java.time.OffsetDateTime;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
 import java.util.List;
@@ -118,8 +115,6 @@ public class LiveScorePoller {
                     }
                 }
                 log.info("Today poll: done — saved={}, skipped={}.", saved, skipped);
-                // Evict all match caches once after the full poll completes so the
-                // next HTTP request reads the complete dataset, not a partial one.
                 evictMatchCaches();
             }
         } catch (Exception e) {
@@ -164,8 +159,6 @@ public class LiveScorePoller {
                     }
                 }
                 log.info("Upcoming poll: done — saved={}, skipped={}.", saved, skipped);
-                // Evict all match caches once after the full poll completes so the
-                // next HTTP request reads the complete dataset, not a partial one.
                 evictMatchCaches();
             }
         } catch (Exception e) {
@@ -237,12 +230,7 @@ public class LiveScorePoller {
 
     /**
      * Clears all match-related Spring caches in one shot after a bulk poll
-     * completes. This ensures the next HTTP request re-queries the DB with
-     * the full dataset rather than serving a stale empty or partial result
-     * that was cached mid-poll.
-     *
-     * Logs each cache name and whether it was found in the CacheManager so
-     * mismatches between declared cache names and actual registrations are
+     * completes. Logs each cache name and found status so mismatches are
      * immediately visible in production logs.
      */
     private void evictMatchCaches() {
@@ -290,6 +278,7 @@ public class LiveScorePoller {
         match.setAwayLogo(LiveScoreApiClient.extractAwayLogo(event));
         match.setLeague(LiveScoreApiClient.extractCompetitionName(event));
 
+        // Score — API returns "2 - 0"; extractScore normalises spaces out to "2-0"
         String scoreStr = LiveScoreApiClient.extractScore(event);
         if (scoreStr != null && scoreStr.contains("-")) {
             String[] parts = scoreStr.split("-");
@@ -299,13 +288,15 @@ public class LiveScorePoller {
             }
         }
 
-        Instant kickoff = parseInstant(LiveScoreApiClient.extractScheduledTime(event));
+        // Kickoff — API gives date ("2026-05-01") and scheduled ("05:00") as separate fields.
+        // buildKickoffInstant combines them into a UTC Instant correctly.
+        Instant kickoff = LiveScoreApiClient.buildKickoffInstant(event);
         if (kickoff == null && "LIVE".equals(match.getStatus())) {
             kickoff = Instant.now().minus(45, ChronoUnit.MINUTES);
         }
         match.setKickoffAt(kickoff);
 
-        // ── Half-time scores → metadata (required for half_time bet settlement) ──
+        // Half-time scores → metadata (required for half_time bet settlement)
         String htScore = LiveScoreApiClient.extractHalfTimeScore(event);
         if (htScore != null && htScore.contains("-")) {
             String[] htParts = htScore.split("-");
@@ -350,31 +341,10 @@ public class LiveScorePoller {
         match.setHomeLogo(LiveScoreApiClient.extractHomeLogo(event));
         match.setAwayLogo(LiveScoreApiClient.extractAwayLogo(event));
         match.setLeague(LiveScoreApiClient.extractCompetitionName(event));
-        match.setKickoffAt(parseInstant(LiveScoreApiClient.extractScheduledTime(event)));
+
+        // Kickoff — combine date + scheduled time fields into a UTC Instant
+        match.setKickoffAt(LiveScoreApiClient.buildKickoffInstant(event));
 
         return match;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // UTILS
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private static Instant parseInstant(Object raw) {
-        if (raw == null) return null;
-        String s = raw.toString().trim();
-        if (s.isEmpty()) return null;
-        try {
-            long epoch = Long.parseLong(s);
-            return (epoch > 10_000_000_000L) ? Instant.ofEpochMilli(epoch) : Instant.ofEpochSecond(epoch);
-        } catch (NumberFormatException ignored) {}
-        try { return OffsetDateTime.parse(s).toInstant(); } catch (DateTimeParseException ignored) {}
-        try {
-            return OffsetDateTime.parse(s + "Z", DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant();
-        } catch (DateTimeParseException ignored) {}
-        try {
-            return OffsetDateTime.parse(s, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssZ")).toInstant();
-        } catch (DateTimeParseException ignored) {}
-        log.debug("parseInstant: could not parse '{}'", s);
-        return null;
     }
 }
