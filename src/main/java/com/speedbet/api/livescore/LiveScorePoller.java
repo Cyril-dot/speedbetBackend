@@ -7,6 +7,8 @@ import com.speedbet.api.sportsdata.LiveScoreApiClient;
 import com.speedbet.api.sportsdata.odds.OddsPersistenceService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -34,9 +36,10 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class LiveScorePoller {
 
-    private final LiveScoreApiClient    liveScoreApiClient;
-    private final MatchService          matchService;
+    private final LiveScoreApiClient     liveScoreApiClient;
+    private final MatchService           matchService;
     private final OddsPersistenceService oddsPersistenceService;
+    private final CacheManager           cacheManager;
 
     // ═══════════════════════════════════════════════════════════════════════
     // 1. LIVE SCORES — every 30 seconds
@@ -115,6 +118,9 @@ public class LiveScorePoller {
                     }
                 }
                 log.info("Today poll: done — saved={}, skipped={}.", saved, skipped);
+                // Evict all match caches once after the full poll completes so the
+                // next HTTP request reads the complete dataset, not a partial one.
+                evictMatchCaches();
             }
         } catch (Exception e) {
             log.error("Today poll: top-level error — {}", e.getMessage(), e);
@@ -158,6 +164,9 @@ public class LiveScorePoller {
                     }
                 }
                 log.info("Upcoming poll: done — saved={}, skipped={}.", saved, skipped);
+                // Evict all match caches once after the full poll completes so the
+                // next HTTP request reads the complete dataset, not a partial one.
+                evictMatchCaches();
             }
         } catch (Exception e) {
             log.error("Upcoming poll: top-level error — {}", e.getMessage(), e);
@@ -223,6 +232,26 @@ public class LiveScorePoller {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // CACHE HELPERS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Clears all match-related Spring caches in one shot after a bulk poll
+     * completes. This ensures the next HTTP request re-queries the DB with
+     * the full dataset rather than serving a stale empty or partial result
+     * that was cached mid-poll.
+     */
+    private void evictMatchCaches() {
+        for (String name : List.of("matches", "todayMatches", "futureMatches", "featuredMatches")) {
+            Cache cache = cacheManager.getCache(name);
+            if (cache != null) {
+                cache.clear();
+            }
+        }
+        log.debug("evictMatchCaches: all match caches cleared after poll.");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // MAPPERS
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -269,7 +298,6 @@ public class LiveScorePoller {
         match.setKickoffAt(kickoff);
 
         // ── Half-time scores → metadata (required for half_time bet settlement) ──
-        // extractHalfTimeScore() reads scores.ht_score, e.g. "1-0"
         String htScore = LiveScoreApiClient.extractHalfTimeScore(event);
         if (htScore != null && htScore.contains("-")) {
             String[] htParts = htScore.split("-");
