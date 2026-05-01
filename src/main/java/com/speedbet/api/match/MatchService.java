@@ -549,7 +549,7 @@ public class MatchService {
     // ══════════════════════════════════════════════════════════════════════
 
     @Transactional
-    @CacheEvict(value = {"matches", "featuredMatches", "todayMatches", "futureMatches"}, allEntries = true)
+    @CacheEvict(value = {"featuredMatches", "todayMatches"}, allEntries = true)
     public Match saveOrUpdate(Match match) {
         if (match.getExternalId() == null || match.getExternalId().isBlank())
             return matchRepo.save(match);
