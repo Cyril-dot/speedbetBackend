@@ -120,14 +120,14 @@ public class LiveScorePoller {
     // 3. UPCOMING FIXTURES (next 7 days) — every hour
     //
     //    Uses the GENERAL endpoint (fixtures/matches.json) which returns
-    //    ALL leagues with flat home_name/away_name fields.
+    //    ALL leagues with flat home_name/away_name/home_image/away_image fields.
     //
     //    FIX: removed the top-6 competition-specific strategy entirely.
     //    The top-6 endpoint returns nested home.name/away.name but its
     //    rows were being saved with empty homeTeam/awayTeam strings when
     //    the match already existed in the DB (saveOrUpdate only fills nulls,
     //    not empty strings). The general endpoint populates home_name /
-    //    away_name which extractHomeName/extractAwayName already handles,
+    //    away_name / home_image / away_image which all extractors now handle,
     //    and covers all leagues — not just top 6.
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -273,6 +273,7 @@ public class LiveScorePoller {
         match.setHomeLogo(LiveScoreApiClient.extractHomeLogo(event));
         match.setAwayLogo(LiveScoreApiClient.extractAwayLogo(event));
         match.setLeague(LiveScoreApiClient.extractCompetitionName(event));
+        match.setLeagueLogo(LiveScoreApiClient.extractLeagueLogo(event));
 
         String scoreStr = LiveScoreApiClient.extractScore(event);
         if (scoreStr != null && scoreStr.contains("-")) {
@@ -322,6 +323,16 @@ public class LiveScorePoller {
             return null;
         }
 
+        // FIX: extract logos using updated extractHomeLogo/extractAwayLogo which now
+        // also check flat fields (home_image, away_image, home_logo, away_logo) used
+        // by the general fixtures endpoint.
+        String homeLogo = LiveScoreApiClient.extractHomeLogo(event);
+        String awayLogo = LiveScoreApiClient.extractAwayLogo(event);
+        String leagueLogo = LiveScoreApiClient.extractLeagueLogo(event);
+
+        log.debug("mapLiveScoreApiFixtureToMatch: id={} homeLogo='{}' awayLogo='{}' leagueLogo='{}'",
+                externalId, homeLogo, awayLogo, leagueLogo);
+
         Match match = new Match();
         match.setExternalId("ls-" + externalId);
         match.setSource(MatchSource.LIVESCORE);
@@ -329,9 +340,10 @@ public class LiveScorePoller {
         match.setStatus("UPCOMING");
         match.setHomeTeam(homeName);
         match.setAwayTeam(awayName);
-        match.setHomeLogo(LiveScoreApiClient.extractHomeLogo(event));
-        match.setAwayLogo(LiveScoreApiClient.extractAwayLogo(event));
+        match.setHomeLogo(homeLogo);
+        match.setAwayLogo(awayLogo);
         match.setLeague(LiveScoreApiClient.extractCompetitionName(event));
+        match.setLeagueLogo(leagueLogo);
 
         Instant kickoff = LiveScoreApiClient.buildKickoffInstant(event);
         match.setKickoffAt(kickoff);

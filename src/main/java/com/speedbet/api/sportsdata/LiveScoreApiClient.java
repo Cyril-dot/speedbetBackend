@@ -32,12 +32,14 @@ import java.util.concurrent.*;
  *
  *   COMPETITION-SPECIFIC endpoints (fixtures/matches.json?competition_id=X):
  *     home.name / away.name     — nested objects
+ *     home.logo / away.logo     — nested logo URL
  *     scheduled                 — full ISO string e.g. "2026-05-01T10:00:00"
  *     fixture_id                — fixture identifier
  *     list key: "fixture"
  *
  *   GENERAL endpoints (fixtures/matches.json with no competition_id):
  *     home_name / away_name     — flat strings
+ *     home_image / away_image   — flat logo URL  ← FIX: was not being read
  *     date + time               — separate fields e.g. date="2026-05-01" time="10:00:00"
  *     id                        — used as fixture identifier (no fixture_id field)
  *     list key: "fixtures"
@@ -352,7 +354,7 @@ public class LiveScoreApiClient {
 
     /**
      * All upcoming fixtures — general endpoint.
-     * Response: flat home_name/away_name, separate date/time, list key "fixtures".
+     * Response: flat home_name/away_name/home_image/away_image, separate date/time, list key "fixtures".
      */
     public List<Map<String, Object>> getUpcomingFixtures() {
         return cached("fixtures:all", () -> {
@@ -372,7 +374,7 @@ public class LiveScoreApiClient {
 
     /**
      * Top-6 upcoming fixtures — competition-specific endpoint per league.
-     * Response: nested home.name/away.name, "scheduled" ISO string, list key "fixture".
+     * Response: nested home.name/away.name/home.logo/away.logo, "scheduled" ISO string, list key "fixture".
      */
     public List<Map<String, Object>> getTop6Fixtures() {
         return cached("fixtures:top6", () -> {
@@ -616,21 +618,63 @@ public class LiveScoreApiClient {
         return flat != null ? flat.toString() : "";
     }
 
+    /**
+     * Home team logo URL.
+     *
+     * FIX: The general endpoint (fixtures/matches.json, no competition_id) does NOT
+     * return a nested "home" object. Logos are flat fields. We now check all known
+     * field names in priority order:
+     *
+     *   1. home.logo          — competition-specific nested shape
+     *   2. home.image         — alternative nested key used by some endpoints
+     *   3. home_image         — general endpoint flat field  ← was missing before
+     *   4. home_logo          — alternative flat key
+     */
     public static String extractHomeLogo(Map<String, Object> match) {
+        // 1 & 2 — nested "home" object (competition-specific endpoint)
         Object home = match.get("home");
         if (home instanceof Map<?, ?> homeMap) {
             Object logo = ((Map<?, ?>) homeMap).get("logo");
-            if (logo != null) return logo.toString();
+            if (logo != null && !logo.toString().isBlank()) return logo.toString();
+            Object image = ((Map<?, ?>) homeMap).get("image");
+            if (image != null && !image.toString().isBlank()) return image.toString();
         }
+        // 3 — flat "home_image" (general endpoint)
+        Object homeImage = match.get("home_image");
+        if (homeImage != null && !homeImage.toString().isBlank()) return homeImage.toString();
+        // 4 — flat "home_logo" (alternative flat key)
+        Object homeLogo = match.get("home_logo");
+        if (homeLogo != null && !homeLogo.toString().isBlank()) return homeLogo.toString();
+
         return "";
     }
 
+    /**
+     * Away team logo URL.
+     *
+     * FIX: mirrors extractHomeLogo — adds flat-field fallbacks for the general endpoint.
+     *
+     *   1. away.logo          — competition-specific nested shape
+     *   2. away.image         — alternative nested key
+     *   3. away_image         — general endpoint flat field  ← was missing before
+     *   4. away_logo          — alternative flat key
+     */
     public static String extractAwayLogo(Map<String, Object> match) {
+        // 1 & 2 — nested "away" object (competition-specific endpoint)
         Object away = match.get("away");
         if (away instanceof Map<?, ?> awayMap) {
             Object logo = ((Map<?, ?>) awayMap).get("logo");
-            if (logo != null) return logo.toString();
+            if (logo != null && !logo.toString().isBlank()) return logo.toString();
+            Object image = ((Map<?, ?>) awayMap).get("image");
+            if (image != null && !image.toString().isBlank()) return image.toString();
         }
+        // 3 — flat "away_image" (general endpoint)
+        Object awayImage = match.get("away_image");
+        if (awayImage != null && !awayImage.toString().isBlank()) return awayImage.toString();
+        // 4 — flat "away_logo" (alternative flat key)
+        Object awayLogo = match.get("away_logo");
+        if (awayLogo != null && !awayLogo.toString().isBlank()) return awayLogo.toString();
+
         return "";
     }
 
@@ -750,6 +794,29 @@ public class LiveScoreApiClient {
             Object name = ((Map<?, ?>) compMap).get("name");
             if (name != null) return name.toString();
         }
+        // General endpoint may expose competition name as a flat field
+        Object compName = match.get("competition_name");
+        if (compName != null && !compName.toString().isBlank()) return compName.toString();
+        return "";
+    }
+
+    /**
+     * League/competition logo URL.
+     * Competition-specific: competition.logo (nested)
+     * General endpoint:     competition_logo (flat)
+     */
+    public static String extractLeagueLogo(Map<String, Object> match) {
+        Object comp = match.get("competition");
+        if (comp instanceof Map<?, ?> compMap) {
+            Object logo = ((Map<?, ?>) compMap).get("logo");
+            if (logo != null && !logo.toString().isBlank()) return logo.toString();
+            Object image = ((Map<?, ?>) compMap).get("image");
+            if (image != null && !image.toString().isBlank()) return image.toString();
+        }
+        Object flat = match.get("competition_logo");
+        if (flat != null && !flat.toString().isBlank()) return flat.toString();
+        Object flat2 = match.get("league_logo");
+        if (flat2 != null && !flat2.toString().isBlank()) return flat2.toString();
         return "";
     }
 
