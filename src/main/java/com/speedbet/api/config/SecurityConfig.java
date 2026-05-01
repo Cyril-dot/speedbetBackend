@@ -78,7 +78,7 @@ public class SecurityConfig {
                         // Tips & webhooks
                         .requestMatchers(HttpMethod.GET, "/api/tip/**").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/webhooks/**").permitAll()
-                        // Add this line in your authorizeHttpRequests block, before .anyRequest().authenticated()
+                        // Booking
                         .requestMatchers(HttpMethod.POST, "/api/booking/redeem").permitAll()
                         // WebSocket & health
                         .requestMatchers("/ws/**").permitAll()
@@ -106,11 +106,29 @@ public class SecurityConfig {
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         var config = new CorsConfiguration();
-        config.setAllowedOrigins(List.of(frontendUrl, "http://localhost:5173", "http://localhost:4173"));
+
+        // Collect all allowed origins: the env-configured URL + hardcoded dev/prod domains.
+        // To add more origins, update APP_PLATFORM_FRONTEND_URL in your Railway env vars
+        // or append to the list below.
+        var origins = new java.util.ArrayList<>(List.of(
+                "http://localhost:5173",
+                "http://localhost:4173",
+                "http://localhost:3000",
+                "https://speedbet.site",
+                "https://www.speedbet.site"
+        ));
+        // Also include whatever is set in the env var (avoids duplicates gracefully)
+        if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
+            origins.add(frontendUrl);
+        }
+
+        config.setAllowedOrigins(origins);
         config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
         config.setAllowedHeaders(List.of("*"));
+        config.setExposedHeaders(List.of("Authorization"));
         config.setAllowCredentials(true);
         config.setMaxAge(3600L);
+
         var source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/**", config);
         return source;
