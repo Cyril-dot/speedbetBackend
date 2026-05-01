@@ -34,7 +34,6 @@ public class PaystackController {
     private final WebClient.Builder webClientBuilder;
 
     @Value("${app.paystack.secret-key}") private String secretKey;
-    @Value("${app.paystack.webhook-secret}") private String webhookSecret;
     @Value("${app.paystack.base-url}") private String baseUrl;
     @Value("${app.platform.min-deposit-amount:300}") private BigDecimal minDeposit;
     @Value("${app.platform.frontend-url}") private String frontendUrl;
@@ -53,19 +52,19 @@ public class PaystackController {
 
         @SuppressWarnings("unchecked")
         var response = (Map<String, Object>) webClientBuilder.build()
-            .post().uri(baseUrl + "/transaction/initialize")
-            .header("Authorization", "Bearer " + secretKey)
-            .header("Content-Type", "application/json")
-            .bodyValue(Map.of(
-                "email", user.getEmail(),
-                "amount", amountKobo,
-                "currency", "GHS",
-                "callback_url", frontendUrl + "/app/wallet",
-                "metadata", Map.of("userId", user.getId().toString())
-            ))
-            .retrieve().bodyToMono(Map.class)
-            .onErrorReturn(Map.of("status", false, "message", "Paystack unavailable"))
-            .block();
+                .post().uri(baseUrl + "/transaction/initialize")
+                .header("Authorization", "Bearer " + secretKey)
+                .header("Content-Type", "application/json")
+                .bodyValue(Map.of(
+                        "email", user.getEmail(),
+                        "amount", amountKobo,
+                        "currency", "GHS",
+                        "callback_url", frontendUrl + "/app/wallet",
+                        "metadata", Map.of("userId", user.getId().toString())
+                ))
+                .retrieve().bodyToMono(Map.class)
+                .onErrorReturn(Map.of("status", false, "message", "Paystack unavailable"))
+                .block();
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
@@ -95,7 +94,7 @@ public class PaystackController {
                 var ref = data.get("reference").toString();
 
                 walletService.credit(userId, amount, TxKind.DEPOSIT, ref,
-                    Map.of("provider", "paystack", "reference", ref));
+                        Map.of("provider", "paystack", "reference", ref));
                 log.info("Paystack deposit GHS {} for user {}", amount, userId);
             }
         } catch (Exception e) {
@@ -107,7 +106,7 @@ public class PaystackController {
     private boolean verifySignature(String payload, String signature) {
         try {
             var mac = Mac.getInstance("HmacSHA512");
-            mac.init(new SecretKeySpec(webhookSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA512"));
+            mac.init(new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA512"));
             var hash = HexFormat.of().formatHex(mac.doFinal(payload.getBytes(StandardCharsets.UTF_8)));
             return hash.equals(signature);
         } catch (Exception e) {
