@@ -19,7 +19,7 @@ public class User implements UserDetails {
     @Id @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
-    @Column(unique = true, nullable = false, columnDefinition = "citext")
+    @Column(unique = true, nullable = false)
     private String email;
 
     private String phone;
@@ -35,13 +35,13 @@ public class User implements UserDetails {
 
     private String country;
 
-    @Convert(converter = UserRoleConverter.class)
-    @Column(nullable = false, columnDefinition = "user_role")
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
     @Builder.Default
     private UserRole role = UserRole.USER;
 
-    @Convert(converter = UserStatusConverter.class)
-    @Column(nullable = false, columnDefinition = "user_status")
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
     @Builder.Default
     private UserStatus status = UserStatus.ACTIVE;
 
@@ -100,6 +100,7 @@ public class User implements UserDetails {
     @Override public boolean isAccountNonLocked()       { return status != UserStatus.LOCKED; }
     @Override public boolean isCredentialsNonExpired()  { return true; }
     @Override public boolean isEnabled()                { return status == UserStatus.ACTIVE; }
+
     @PrePersist
     protected void onCreate() {
         if (createdAt == null) createdAt = LocalDateTime.now();
