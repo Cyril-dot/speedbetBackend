@@ -122,8 +122,8 @@ public class MatchService {
     @Cacheable("matches")
     public List<Match> getUpcomingMatches() {
         Instant now = Instant.now();
-        List<Match> matches = matchRepo.findUpcomingScheduled(now, now.plus(48, ChronoUnit.HOURS));
-        log.info("getUpcomingMatches: {} upcoming match(es) (next 48h)", matches.size());
+        List<Match> matches = matchRepo.findUpcomingScheduled(now, now.plus(7, ChronoUnit.DAYS));
+        log.info("getUpcomingMatches: {} upcoming match(es) (next 7 days)", matches.size());
         return matches;
     }
 
