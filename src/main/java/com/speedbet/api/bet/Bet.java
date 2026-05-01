@@ -36,9 +36,9 @@ public class Bet {
     @Column(name = "potential_return", precision = 19, scale = 4)
     private BigDecimal potentialReturn;
 
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
     @Builder.Default
-    @Convert(converter = BetStatusConverter.class)
-    @Column(nullable = false, columnDefinition = "bet_status")
     private BetStatus status = BetStatus.PENDING;
 
     @Builder.Default

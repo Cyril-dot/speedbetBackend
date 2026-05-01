@@ -21,8 +21,8 @@ public class Transaction {
     @Column(name = "wallet_id", nullable = false)
     private UUID walletId;
 
-    @Convert(converter = TxKindConverter.class)
-    @Column(nullable = false, columnDefinition = "tx_kind")
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
     private TxKind kind;
 
     @Column(nullable = false, precision = 19, scale = 4)
