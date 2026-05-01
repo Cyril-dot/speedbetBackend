@@ -41,6 +41,8 @@ public class Bet {
     @Builder.Default
     private BetStatus status = BetStatus.PENDING;
 
+
+
     @Builder.Default
     @Column(name = "win_seen")
     private boolean winSeen = false;
