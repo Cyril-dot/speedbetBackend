@@ -74,31 +74,66 @@ public class PaystackController {
             @RequestBody String payload) {
 
         if (!verifySignature(payload, signature)) {
-            log.warn("Invalid Paystack webhook signature");
+            log.warn("Paystack webhook: invalid signature received");
             return ResponseEntity.status(400).body("Invalid signature");
         }
 
         try {
-            var event = new com.fasterxml.jackson.databind.ObjectMapper().readValue(payload, Map.class);
+            @SuppressWarnings("unchecked")
+            var event = (Map<String, Object>) new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readValue(payload, Map.class);
             var eventType = event.get("event").toString();
 
+            log.info("Paystack webhook received: event={}", eventType);
+
             if ("charge.success".equals(eventType)) {
+
                 @SuppressWarnings("unchecked")
                 var data = (Map<String, Object>) event.get("data");
+
                 @SuppressWarnings("unchecked")
                 var metadata = (Map<String, Object>) data.get("metadata");
+
+                if (metadata == null || metadata.get("userId") == null) {
+                    log.error("Paystack webhook: missing userId in metadata, ref={}", data.get("reference"));
+                    return ResponseEntity.status(400).body("Missing userId in metadata");
+                }
+
                 var userId = UUID.fromString(metadata.get("userId").toString());
+                var ref = data.get("reference").toString();
                 var amountKobo = Long.parseLong(data.get("amount").toString());
                 var amount = BigDecimal.valueOf(amountKobo).divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
-                var ref = data.get("reference").toString();
 
-                walletService.credit(userId, amount, TxKind.DEPOSIT, ref,
-                        Map.of("provider", "paystack", "reference", ref));
-                log.info("Paystack deposit GHS {} for user {}", amount, userId);
+                log.info("Paystack webhook: processing deposit GHS {} for userId={} ref={}", amount, userId, ref);
+
+                try {
+                    walletService.credit(userId, amount, TxKind.DEPOSIT, ref,
+                            Map.of("provider", "paystack", "reference", ref));
+                    log.info("Paystack webhook: deposit GHS {} credited to userId={} ref={}", amount, userId, ref);
+                } catch (ApiException ex) {
+                    // FIX: use .value() to compare HttpStatus to int
+                    if (ex.getStatus().value() == 409) {
+                        // WalletService idempotency already caught this duplicate — safe to ignore
+                        log.warn("Paystack webhook: duplicate ref={} already processed — skipping", ref);
+                        return ResponseEntity.ok("Already processed");
+                    }
+                    throw ex; // re-throw anything else so outer catch handles it
+                }
+
+            } else {
+                log.info("Paystack webhook: ignoring event={}", eventType);
             }
+
+        } catch (ApiException e) {
+            // Bad data, no point retrying — return 400
+            log.error("Paystack webhook: bad request — {}", e.getMessage(), e);
+            return ResponseEntity.status(400).body("Bad request: " + e.getMessage());
         } catch (Exception e) {
-            log.error("Paystack webhook processing error", e);
+            // Unexpected error — return 500 so Paystack retries automatically
+            log.error("Paystack webhook: unexpected error — will retry", e);
+            return ResponseEntity.status(500).body("Processing error");
         }
+
         return ResponseEntity.ok("OK");
     }
 
@@ -109,6 +144,7 @@ public class PaystackController {
             var hash = HexFormat.of().formatHex(mac.doFinal(payload.getBytes(StandardCharsets.UTF_8)));
             return hash.equals(signature);
         } catch (Exception e) {
+            log.error("Paystack webhook: signature verification error", e);
             return false;
         }
     }
