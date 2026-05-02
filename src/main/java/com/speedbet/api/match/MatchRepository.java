@@ -25,6 +25,21 @@ public interface MatchRepository extends JpaRepository<Match, UUID> {
     @Query("SELECT m FROM Match m WHERE m.status = 'FINISHED' AND m.settledAt IS NULL")
     List<Match> findUnsettledFinished();
 
+    List<Match> findBySourceOrderByKickoffAtDesc(MatchSource source);
+
+    /**
+     * Convenience — find by source and status (useful for future admin filters).
+     */
+    List<Match> findBySourceAndStatus(MatchSource source, String status);
+
+    List<Match> findByCreatedByAdminIdOrderByKickoffAtDesc(UUID createdByAdminId);
+
+    /**
+     * Matches by a specific admin filtered by status (e.g. "LIVE").
+     * Optional — available for future admin dashboard filters.
+     */
+    List<Match> findByCreatedByAdminIdAndStatus(UUID createdByAdminId, String status);
+
     Optional<Match> findByExternalId(String externalId);
 
     Page<Match> findByLeagueContainingIgnoreCaseOrHomeTeamContainingIgnoreCaseOrAwayTeamContainingIgnoreCase(
@@ -70,4 +85,5 @@ public interface MatchRepository extends JpaRepository<Match, UUID> {
                AND m.kickoffAt < :cutoff
             """)
     List<Match> findStaleLive(@Param("cutoff") Instant cutoff);
+
 }

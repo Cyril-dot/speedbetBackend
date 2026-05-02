@@ -56,6 +56,9 @@ public class Match {
     @Column(name = "away_logo")
     private String awayLogo;
 
+    @Column(name = "created_by_admin_id")
+    private UUID createdByAdminId;
+
     @Column(name = "league_logo")
     private String leagueLogo;
 
