@@ -19,48 +19,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-/**
- * Centralised polling orchestrator.
- *
- * Schedules:
- *   • Logo cache warm   — at startup + every 6h (competition-specific endpoints → TeamLogoCache)
- *   • Live scores       — every  30s
- *   • Today's fixtures  — every  15min
- *   • Upcoming (7 days) — every   1h
- *   • Stale LIVE sweep  — every  10min
- *   • Live odds refresh — every   2min
- *
- * ── How logos flow through the system ────────────────────────────────────
- *
- *   LIVE matches (pollLiveScores):
- *     matches/live.json always returns nested home.logo / away.logo.
- *     extractHomeLogo() reads home.logo → logos are always present.
- *     These are used as the reference shape — everything else mirrors this.
- *
- *   TOP-6 fixtures (pollUpcomingFixtures Step A):
- *     fixtures/matches.json?competition_id=X returns same nested shape as live.
- *     Logos extracted directly + ingested into TeamLogoCache for later reuse.
- *
- *   GENERAL fixtures (pollUpcomingFixtures Step B):
- *     fixtures/matches.json (no competition_id) returns flat home_image/away_image.
- *     extractHomeLogo() now reads these flat fields as fallback (fix applied).
- *     Any remaining blanks are backfilled from TeamLogoCache via enrichLogos().
- *     Fixtures already saved in Step A are deduplicated by externalId.
- *
- *   Result: top-6 fixtures always get logos; other leagues get logos from
- *           the cache or from flat API fields where available.
- *
- * ── Cache eviction strategy ───────────────────────────────────────────────
- *
- *   saveOrUpdate() carries @CacheEvict("matches") which would evict — and
- *   allow re-population — mid-poll if a web request arrives while Step A or
- *   Step B is still iterating. To prevent a partially-enriched snapshot from
- *   being cached, evictUpcomingCaches() is called explicitly at the END of
- *   each complete poll phase rather than relying on per-row eviction.
- *
- *   saveOrUpdate() therefore does NOT evict "matches" or "futureMatches";
- *   those caches are only cleared here, after a full phase is committed.
- */
 @Slf4j
 @Component
 @RequiredArgsConstructor
@@ -180,22 +138,6 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 3. UPCOMING FIXTURES (next 7 days) — every hour
-    //
-    //    Step A — top-6 competition-specific fixtures (logos always present).
-    //             Cache is evicted after Step A so any request that arrives
-    //             between Step A and Step B sees logo-complete top-6 data
-    //             rather than a stale pre-poll snapshot.
-    //
-    //    Step B — general endpoint (flat home_image/away_image + cache backfill).
-    //             Cache evicted again after Step B is fully committed.
-    //
-    //    Why two evictions instead of one at the end:
-    //      Without the mid-poll eviction, a web request that arrives while
-    //      Step B is still iterating can re-populate the Spring cache from
-    //      the DB mid-write, capturing a partially-enriched snapshot. Evicting
-    //      after Step A means the worst case is the cache fills with 145 clean
-    //      Step-A rows; the Step-B eviction then forces a fresh read once all
-    //      30 general fixtures are committed too.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 60 * 60_000L, initialDelay = 30_000L)
@@ -234,13 +176,9 @@ public class LiveScorePoller {
                 log.info("Upcoming poll [A]: no top-6 fixtures returned.");
             }
 
-            // Evict after Step A so requests arriving between Step A and Step B
-            // see the fully logo-enriched top-6 rows rather than a stale snapshot.
-            // This is the key fix: previously the cache was only evicted at the very
-            // end, after Step B, so a request mid-poll could cache partial data.
             evictUpcomingCaches();
 
-            // ── Step B: general endpoint (flat home_image/away_image + cache backfill) ──
+            // ── Step B: general endpoint ──
             log.info("Upcoming poll [B]: fetching general upcoming fixtures... Logo cache size={}",
                     teamLogoCache.size());
             List<Map<String, Object>> fixtures = liveScoreApiClient.getUpcomingFixtures();
@@ -278,8 +216,6 @@ public class LiveScorePoller {
                 log.info("Upcoming poll [B]: done — saved={}, skipped={}, logoHits={}.", saved, skipped, logoHits);
             }
 
-            // Final eviction after Step B — forces a clean DB read that includes
-            // any logos backfilled by enrichLogos() during Step B.
             evictMatchCaches();
 
         } catch (Exception e) {
@@ -365,13 +301,6 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // CACHE HELPERS
-    //
-    //   evictUpcomingCaches() — clears only "matches" and "futureMatches".
-    //     Called after Step A completes so the next read sees logo-complete
-    //     top-6 fixtures rather than a pre-poll stale snapshot.
-    //
-    //   evictMatchCaches() — clears all four match caches.
-    //     Called after each full poll phase (today poll, end of Step B).
     // ═══════════════════════════════════════════════════════════════════════
 
     private void evictUpcomingCaches() {
@@ -437,11 +366,15 @@ public class LiveScorePoller {
             }
         }
 
+        // FIX: never use Instant.now() as a kickoff fallback.
+        // The live endpoint does not return kickoff times — only the fixtures
+        // endpoint does. Saving now()-based timestamps poisons the DB with fake
+        // values that never get corrected (saveOrUpdate won't overwrite them).
+        // Leave kickoffAt null for live matches with no parseable kickoff;
+        // saveOrUpdate will backfill it when the fixture poll runs and finds a
+        // real value, and the frontend shows the pulsing LIVE dot regardless.
         Instant kickoff = LiveScoreApiClient.buildKickoffInstant(event);
-        if (kickoff == null && "LIVE".equals(match.getStatus())) {
-            kickoff = Instant.now().minus(45, ChronoUnit.MINUTES);
-        }
-        match.setKickoffAt(kickoff);
+        match.setKickoffAt(kickoff); // null is fine — do NOT substitute Instant.now()
 
         String htScore = LiveScoreApiClient.extractHalfTimeScore(event);
         if (htScore != null && htScore.contains("-")) {

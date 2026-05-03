@@ -53,22 +53,23 @@ public class MatchService {
     }
 
     /**
-     * Returns true if both team logos are present and non-blank.
-     * Used to sort logo-complete matches to the top of any list shown in
-     * the frontend, so fixtures from well-covered leagues (PL, Bundesliga,
-     * etc.) display instead of lower-tier fixtures that lack artwork.
+     * Returns true if an Instant looks like a real kickoff time from the
+     * fixtures API (clean round minute, zero nanoseconds) rather than a
+     * fake fallback produced by Instant.now() (which always has non-zero
+     * nanoseconds due to microsecond precision).
+     *
+     * Examples:
+     *   2026-05-03T13:00:00Z      → getNano() == 0  → REAL kickoff ✓
+     *   2026-05-03T04:00:39.778Z  → getNano() != 0  → fake now()  ✗
      */
+    private static boolean isRealKickoff(Instant t) {
+        return t != null && t.getNano() == 0;
+    }
+
     private static boolean hasLogos(Match m) {
         return !isMissing(m.getHomeLogo()) && !isMissing(m.getAwayLogo());
     }
 
-    /**
-     * Stable logo-aware comparator: logo-complete matches first, then sort
-     * by kickoff ascending within each group.
-     *
-     * Using Comparator.comparingInt keeps the sort O(n log n) with no
-     * extra allocations — 0 = has logos, 1 = missing logos.
-     */
     private static final Comparator<Match> LOGO_THEN_KICKOFF =
             Comparator.comparingInt((Match m) -> hasLogos(m) ? 0 : 1)
                     .thenComparing(m -> m.getKickoffAt() != null ? m.getKickoffAt() : Instant.MAX);
@@ -106,9 +107,6 @@ public class MatchService {
         liveHandicapCache.put(matchId, new OddsCacheEntry(odds, expires));
     }
 
-    /**
-     * Exposes the live odds cache to BetService for odds resolution at bet-placement time.
-     */
     public List<Map<String, Object>> getOddsFromCache(UUID matchId, String market) {
         return switch (market) {
             case "1X2" -> {
@@ -139,14 +137,7 @@ public class MatchService {
     public List<Match> getUpcomingMatches() {
         Instant now = Instant.now();
         List<Match> matches = matchRepo.findUpcomingScheduled(now, now.plus(7, ChronoUnit.DAYS));
-
-        // Sort: logo-complete matches first (so the frontend shows well-covered
-        // leagues like PL/Bundesliga rather than logo-less lower-tier fixtures),
-        // then ascending kickoff within each group.
-        List<Match> sorted = matches.stream()
-                .sorted(LOGO_THEN_KICKOFF)
-                .toList();
-
+        List<Match> sorted = matches.stream().sorted(LOGO_THEN_KICKOFF).toList();
         int withLogos    = (int) sorted.stream().filter(MatchService::hasLogos).count();
         int withoutLogos = sorted.size() - withLogos;
         log.info("getUpcomingMatches: {} upcoming match(es) — {} with logos, {} without (logo-first sort applied)",
@@ -166,13 +157,7 @@ public class MatchService {
     public List<Match> getFutureMatches() {
         Instant now = Instant.now();
         List<Match> matches = matchRepo.findUpcomingScheduled(now, now.plus(7, ChronoUnit.DAYS));
-
-        // Same logo-first sort as getUpcomingMatches — both feed the same
-        // frontend surfaces.
-        List<Match> sorted = matches.stream()
-                .sorted(LOGO_THEN_KICKOFF)
-                .toList();
-
+        List<Match> sorted = matches.stream().sorted(LOGO_THEN_KICKOFF).toList();
         int withLogos    = (int) sorted.stream().filter(MatchService::hasLogos).count();
         int withoutLogos = sorted.size() - withLogos;
         log.info("getFutureMatches: {} match(es) next 7 days — {} with logos, {} without (logo-first sort applied)",
@@ -212,26 +197,19 @@ public class MatchService {
 
     public List<Map<String, Object>> withOdds(List<Match> matches) {
         if (matches.isEmpty()) return Collections.emptyList();
-
-        // Apply logo-first sort before bundling so callers that pass a raw
-        // repo list (e.g. getLiveMatches()) also benefit from the ordering.
         List<Match> sorted = matches.stream().sorted(LOGO_THEN_KICKOFF).toList();
         log.debug("withOdds: bundling odds for {} match(es)", sorted.size());
-
         List<Map<String, Object>> out = new ArrayList<>(sorted.size());
         for (Match match : sorted) {
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("match", match);
-
             String status = match.getStatus();
             if ("LIVE".equals(status)) {
                 OddsCacheEntry cached = liveOddsCache.get(match.getId());
                 entry.put("odds", (cached != null && cached.isValid()) ? cached.odds() : List.of());
-
             } else if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
                 entry.put("odds", oddsGeneratorService.generatePreMatchOdds(
                         match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
-
             } else {
                 entry.put("odds", List.of());
             }
@@ -243,29 +221,23 @@ public class MatchService {
 
     public List<Map<String, Object>> withAllOdds(List<Match> matches) {
         if (matches.isEmpty()) return Collections.emptyList();
-
-        // Same logo-first sort as withOdds.
         List<Match> sorted = matches.stream().sorted(LOGO_THEN_KICKOFF).toList();
         log.debug("withAllOdds: bundling all markets for {} match(es)", sorted.size());
-
         List<Map<String, Object>> out = new ArrayList<>(sorted.size());
         for (Match match : sorted) {
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("match", match);
-
             String status = match.getStatus();
             if ("LIVE".equals(status)) {
                 OddsCacheEntry oddsEntry     = liveOddsCache.get(match.getId());
                 OddsCacheEntry handicapEntry = liveHandicapCache.get(match.getId());
                 entry.put("match_result",   (oddsEntry     != null && oddsEntry.isValid())     ? oddsEntry.odds()     : List.of());
                 entry.put("asian_handicap", (handicapEntry != null && handicapEntry.isValid()) ? handicapEntry.odds() : List.of());
-
             } else if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
                 entry.put("match_result", oddsGeneratorService.generatePreMatchOdds(
                         match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
                 entry.put("asian_handicap", handicapOddsService.generateHandicapOdds(
                         match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
-
             } else {
                 entry.put("match_result",   List.of());
                 entry.put("asian_handicap", List.of());
@@ -282,15 +254,11 @@ public class MatchService {
 
     public void refreshLiveOddsCache(List<Match> liveMatches) {
         if (liveMatches.isEmpty()) return;
-
-        int refreshed1X2      = 0;
-        int refreshedHandicap = 0;
-
+        int refreshed1X2 = 0, refreshedHandicap = 0;
         for (Match match : liveMatches) {
             int scoreHome = match.getScoreHome() != null ? match.getScoreHome() : 0;
             int scoreAway = match.getScoreAway() != null ? match.getScoreAway() : 0;
             int minute    = extractMinute(match);
-
             try {
                 List<Map<String, Object>> liveOdds = liveOddsGeneratorService.generateLiveOdds(
                         match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
@@ -299,7 +267,6 @@ public class MatchService {
             } catch (Exception e) {
                 log.warn("refreshLiveOddsCache [1X2]: matchId={} failed — {}", match.getId(), e.getMessage());
             }
-
             try {
                 List<Map<String, Object>> liveHandicap = handicapOddsService.generateLiveHandicapOdds(
                         match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
@@ -309,7 +276,6 @@ public class MatchService {
                 log.warn("refreshLiveOddsCache [Handicap]: matchId={} failed — {}", match.getId(), e.getMessage());
             }
         }
-
         log.info("refreshLiveOddsCache: 1X2={}/{} Handicap={}/{} match(es) refreshed",
                 refreshed1X2, liveMatches.size(), refreshedHandicap, liveMatches.size());
     }
@@ -321,7 +287,7 @@ public class MatchService {
                 try { return Integer.parseInt(min.toString()); } catch (NumberFormatException ignored) {}
             }
         }
-        if (match.getKickoffAt() != null) {
+        if (match.getKickoffAt() != null && isRealKickoff(match.getKickoffAt())) {
             long elapsed = ChronoUnit.MINUTES.between(match.getKickoffAt(), Instant.now());
             return (int) Math.min(Math.max(elapsed, 0), 95);
         }
@@ -329,13 +295,12 @@ public class MatchService {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // ODDS — direct endpoints (1X2)
+    // ODDS — direct endpoints
     // ══════════════════════════════════════════════════════════════════════
 
     public List<Map<String, Object>> getMatchOdds(String id) {
         Match match = getById(id);
         String status = match.getStatus();
-
         if ("LIVE".equals(status)) {
             OddsCacheEntry cached = liveOddsCache.get(match.getId());
             if (cached != null && cached.isValid()) return cached.odds();
@@ -347,18 +312,12 @@ public class MatchService {
             cacheLiveOdds(match.getId(), generated);
             return generated;
         }
-
         if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
             return oddsGeneratorService.generatePreMatchOdds(
                     match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
         }
-
         return List.of();
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // ODDS — direct endpoints (Correct Score, Half Time)
-    // ══════════════════════════════════════════════════════════════════════
 
     public List<Map<String, Object>> getCorrectScoreOdds(String id) {
         Match match = getById(id);
@@ -380,14 +339,9 @@ public class MatchService {
                 match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    // ODDS — direct endpoints (Handicap)
-    // ══════════════════════════════════════════════════════════════════════
-
     public List<Map<String, Object>> getHandicapOdds(String id) {
         Match match = getById(id);
         String status = match.getStatus();
-
         if ("LIVE".equals(status)) {
             OddsCacheEntry cached = liveHandicapCache.get(match.getId());
             if (cached != null && cached.isValid()) return cached.odds();
@@ -399,18 +353,12 @@ public class MatchService {
             cacheLiveHandicapOdds(match.getId(), generated);
             return generated;
         }
-
         if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
             return handicapOddsService.generateHandicapOdds(
                     match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
         }
-
         return List.of();
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // ODDS — full multi-market bundle
-    // ══════════════════════════════════════════════════════════════════════
 
     public Map<String, Object> getAllOddsForMatch(String id) {
         Map<String, Object> result = new LinkedHashMap<>();
@@ -535,15 +483,15 @@ public class MatchService {
     // ══════════════════════════════════════════════════════════════════════
     // PERSISTENCE
     //
-    // FIX: saveOrUpdate previously used `existing.getHomeTeam() == null`
-    // to decide whether to fill in team names. The upcoming fixture poller
-    // was saving rows with homeTeam="" (empty string, not null) so the
-    // null-check never fired and names were never backfilled.
+    // kickoffAt update rule:
+    //   - If existing is null → always set from incoming
+    //   - If existing is a fake now()-based timestamp (getNano() != 0) AND
+    //     incoming is a real fixture kickoff (getNano() == 0) → overwrite
+    //   - Otherwise → keep existing (don't overwrite a real kickoff)
     //
-    // Changed all "fill if null" guards to isMissing() which treats both
-    // null AND empty/blank strings as "needs to be filled in". This means:
-    //   - A fresh row with homeTeam="" will be updated with the real name.
-    //   - A row that already has a real name ("Arsenal") will not be overwritten.
+    // This means the fixture poller (which returns clean round times like
+    // 13:00:00Z) will always heal a row that was previously poisoned by the
+    // live poll's now()-based fallback, and will never overwrite a good value.
     // ══════════════════════════════════════════════════════════════════════
 
     @Transactional
@@ -560,7 +508,7 @@ public class MatchService {
                     if (match.getScoreAway() != null) existing.setScoreAway(match.getScoreAway());
                     if (match.getMetadata()  != null) existing.setMetadata(match.getMetadata());
 
-                    // FIX: use isMissing() so empty strings are overwritten too
+                    // Fill missing string fields (use isMissing so empty strings are treated as null)
                     if (isMissing(existing.getHomeTeam())   && !isMissing(match.getHomeTeam()))   existing.setHomeTeam(match.getHomeTeam());
                     if (isMissing(existing.getAwayTeam())   && !isMissing(match.getAwayTeam()))   existing.setAwayTeam(match.getAwayTeam());
                     if (isMissing(existing.getLeague())     && !isMissing(match.getLeague()))     existing.setLeague(match.getLeague());
@@ -568,17 +516,34 @@ public class MatchService {
                     if (isMissing(existing.getHomeLogo())   && !isMissing(match.getHomeLogo()))   existing.setHomeLogo(match.getHomeLogo());
                     if (isMissing(existing.getAwayLogo())   && !isMissing(match.getAwayLogo()))   existing.setAwayLogo(match.getAwayLogo());
                     if (isMissing(existing.getLeagueLogo()) && !isMissing(match.getLeagueLogo())) existing.setLeagueLogo(match.getLeagueLogo());
-                    if (existing.getKickoffAt()  == null && match.getKickoffAt()  != null) existing.setKickoffAt(match.getKickoffAt());
-                    if (existing.getSource()     == null && match.getSource()     != null) existing.setSource(match.getSource());
 
-                    log.debug("saveOrUpdate: updated externalId={} home='{}' away='{}' homeLogo='{}' awayLogo='{}'",
+                    // FIX: kickoffAt — overwrite fake now()-based values with real fixture kickoffs.
+                    // Real kickoff times from the fixtures API always have getNano() == 0
+                    // (e.g. 2026-05-03T13:00:00Z). Fake fallback values from Instant.now()
+                    // always have getNano() != 0 (e.g. 2026-05-03T04:00:39.778855Z).
+                    if (match.getKickoffAt() != null) {
+                        boolean existingIsFakeOrNull = existing.getKickoffAt() == null
+                                || !isRealKickoff(existing.getKickoffAt());
+                        boolean incomingIsReal = isRealKickoff(match.getKickoffAt());
+                        if (existingIsFakeOrNull && incomingIsReal) {
+                            log.debug("saveOrUpdate: healing kickoffAt externalId={} old={} new={}",
+                                    existing.getExternalId(), existing.getKickoffAt(), match.getKickoffAt());
+                            existing.setKickoffAt(match.getKickoffAt());
+                        } else if (existing.getKickoffAt() == null) {
+                            existing.setKickoffAt(match.getKickoffAt());
+                        }
+                    }
+
+                    if (existing.getSource() == null && match.getSource() != null) existing.setSource(match.getSource());
+
+                    log.debug("saveOrUpdate: updated externalId={} home='{}' away='{}' kickoff='{}'",
                             existing.getExternalId(), existing.getHomeTeam(), existing.getAwayTeam(),
-                            existing.getHomeLogo(), existing.getAwayLogo());
+                            existing.getKickoffAt());
                     return matchRepo.save(existing);
                 })
                 .orElseGet(() -> {
-                    log.debug("saveOrUpdate: inserting new externalId={} home='{}' away='{}'",
-                            match.getExternalId(), match.getHomeTeam(), match.getAwayTeam());
+                    log.debug("saveOrUpdate: inserting new externalId={} home='{}' away='{}' kickoff='{}'",
+                            match.getExternalId(), match.getHomeTeam(), match.getAwayTeam(), match.getKickoffAt());
                     return matchRepo.save(match);
                 });
     }
