@@ -650,13 +650,8 @@ public class LiveScoreApiClient {
      *   2. home.image         — alternative nested key used by some endpoints
      *   3. home_image         — general fixture endpoint flat field
      *   4. home_logo          — alternative flat key
-     *
-     * The live endpoint always returns shape 1 (home.logo), which is why live
-     * matches always have logos. We apply the same chain so fixture endpoints
-     * also resolve correctly regardless of which shape they use.
      */
     public static String extractHomeLogo(Map<String, Object> match) {
-        // 1 & 2 — nested "home" object (live + competition-specific endpoints)
         Object home = match.get("home");
         if (home instanceof Map<?, ?> homeMap) {
             Object logo = ((Map<?, ?>) homeMap).get("logo");
@@ -664,13 +659,10 @@ public class LiveScoreApiClient {
             Object image = ((Map<?, ?>) homeMap).get("image");
             if (image != null && !image.toString().isBlank()) return image.toString();
         }
-        // 3 — flat "home_image" (general fixture endpoint)
         Object homeImage = match.get("home_image");
         if (homeImage != null && !homeImage.toString().isBlank()) return homeImage.toString();
-        // 4 — flat "home_logo" (alternative flat key)
         Object homeLogo = match.get("home_logo");
         if (homeLogo != null && !homeLogo.toString().isBlank()) return homeLogo.toString();
-
         return "";
     }
 
@@ -684,7 +676,6 @@ public class LiveScoreApiClient {
      *   4. away_logo          — alternative flat key
      */
     public static String extractAwayLogo(Map<String, Object> match) {
-        // 1 & 2 — nested "away" object (live + competition-specific endpoints)
         Object away = match.get("away");
         if (away instanceof Map<?, ?> awayMap) {
             Object logo = ((Map<?, ?>) awayMap).get("logo");
@@ -692,13 +683,10 @@ public class LiveScoreApiClient {
             Object image = ((Map<?, ?>) awayMap).get("image");
             if (image != null && !image.toString().isBlank()) return image.toString();
         }
-        // 3 — flat "away_image" (general fixture endpoint)
         Object awayImage = match.get("away_image");
         if (awayImage != null && !awayImage.toString().isBlank()) return awayImage.toString();
-        // 4 — flat "away_logo" (alternative flat key)
         Object awayLogo = match.get("away_logo");
         if (awayLogo != null && !awayLogo.toString().isBlank()) return awayLogo.toString();
-
         return "";
     }
 
@@ -758,12 +746,12 @@ public class LiveScoreApiClient {
      * Builds a UTC Instant for kickoff — handles all three API response shapes.
      *
      * Shape 1 — Live (matches/live.json):
-     *   "date": "2026-05-01"  +  "time": "45" (match clock, not kickoff)
-     *   → kickoff = date combined with a fallback or stored kickoffAt (not reconstructable here)
+     *   "date": "2026-05-01"  +  "time": "45" (match clock, not kickoff — SKIPPED)
+     *   → returns null; caller in LiveScorePoller falls back to Instant.now().minus(45min)
      *
      * Shape 2 — Competition-specific (fixtures/matches.json?competition_id=X):
      *   "scheduled": "2026-05-01T10:00:00"  → parsed as LocalDateTime UTC
-     *   "scheduled": "10:00"                 → combined with "date" field
+     *   "scheduled": "10:00"                → combined with "date" field
      *
      * Shape 3 — General (fixtures/matches.json, no competition_id):
      *   "date": "2026-05-01"  +  "time": "10:00:00"  → combined as UTC Instant
@@ -775,28 +763,47 @@ public class LiveScoreApiClient {
         // ── Shape 2: "scheduled" field (competition-specific endpoint) ────
         Object scheduledObj = match.get("scheduled");
         if (scheduledObj != null && !scheduledObj.toString().isBlank()) {
-            String scheduled = scheduledObj.toString();
-            // Full ISO datetime e.g. "2026-05-01T10:00:00"
+            String scheduled = scheduledObj.toString().trim();
+
+            // Full ISO datetime e.g. "2026-05-01T10:00:00" or with offset
             if (scheduled.contains("T")) {
                 try { return LocalDateTime.parse(scheduled).toInstant(ZoneOffset.UTC); }
                 catch (DateTimeParseException ignored) {}
                 try { return OffsetDateTime.parse(scheduled).toInstant(); }
                 catch (DateTimeParseException ignored) {}
+                log.debug("buildKickoffInstant: could not parse ISO scheduled='{}'", scheduled);
+                return null;
             }
-            // Bare "HH:mm" — fall through to combine with date below
+            // Bare "HH:mm" or "HH:mm:ss" — fall through to combine with "date" below
         }
 
-        // ── Shape 3: "date" + "time" fields (general fixture endpoint) ───
+        // ── Shapes 1 & 3: "date" + "time" fields ─────────────────────────
+        //
+        // KEY FIX: the "time" field means different things depending on the endpoint:
+        //   - Live endpoint:    match clock e.g. "45", "90+2", "HT", "FT"  → NOT a kickoff time
+        //   - General fixture:  kickoff time  e.g. "10:00:00", "20:45:00"  → valid kickoff time
+        //
+        // We distinguish them by checking for a colon — valid kickoff times always
+        // contain ":" (HH:mm or HH:mm:ss). Match clocks are purely numeric or
+        // short status strings like "HT"/"FT" and never contain a colon.
         String date    = extractMatchDate(match);
         String timeStr = "";
 
-        // General endpoint: "time" field holds kickoff time e.g. "10:00:00"
         Object timeObj = match.get("time");
         if (timeObj != null && !timeObj.toString().isBlank()) {
-            timeStr = timeObj.toString();
-        } else if (scheduledObj != null && !scheduledObj.toString().isBlank()) {
-            // Bare HH:mm from "scheduled" field (shape 2 partial)
-            timeStr = scheduledObj.toString();
+            String raw = timeObj.toString().trim();
+            if (raw.contains(":")) {
+                // Looks like a clock time — safe to use as kickoff
+                timeStr = raw;
+            } else {
+                // Purely numeric or status marker (e.g. "45", "HT") — match clock, skip it
+                log.debug("buildKickoffInstant: 'time'='{}' looks like a match clock, skipping", raw);
+            }
+        }
+
+        // Fallback: bare "HH:mm" or "HH:mm:ss" from "scheduled" field (shape 2 partial)
+        if (timeStr.isBlank() && scheduledObj != null && !scheduledObj.toString().isBlank()) {
+            timeStr = scheduledObj.toString().trim();
         }
 
         if (date.isBlank() || timeStr.isBlank()) {
@@ -805,10 +812,16 @@ public class LiveScoreApiClient {
         }
 
         try {
-            LocalDate ld   = LocalDate.parse(date, DateTimeFormatter.ISO_LOCAL_DATE);
-            // Normalise to HH:mm — handles "10:00:00" and "10:00" both
-            String    hhmm = timeStr.length() >= 5 ? timeStr.substring(0, 5) : timeStr;
-            LocalTime lt   = LocalTime.parse(hhmm, DateTimeFormatter.ofPattern("HH:mm"));
+            LocalDate ld = LocalDate.parse(date, DateTimeFormatter.ISO_LOCAL_DATE);
+
+            // Normalise time: handle both "HH:mm:ss" (length > 5) and "HH:mm" (length == 5)
+            LocalTime lt;
+            if (timeStr.length() > 5) {
+                lt = LocalTime.parse(timeStr, DateTimeFormatter.ofPattern("HH:mm:ss"));
+            } else {
+                lt = LocalTime.parse(timeStr, DateTimeFormatter.ofPattern("HH:mm"));
+            }
+
             Instant kickoff = LocalDateTime.of(ld, lt).toInstant(ZoneOffset.UTC);
             log.debug("buildKickoffInstant: date='{}' time='{}' → {}", date, timeStr, kickoff);
             return kickoff;
@@ -824,7 +837,6 @@ public class LiveScoreApiClient {
             Object name = ((Map<?, ?>) compMap).get("name");
             if (name != null) return name.toString();
         }
-        // General endpoint exposes competition name as a flat field
         Object compName = match.get("competition_name");
         if (compName != null && !compName.toString().isBlank()) return compName.toString();
         return "";
@@ -894,20 +906,17 @@ public class LiveScoreApiClient {
         if (response == null) return Collections.emptyList();
         Object data = response.get("data");
         if (data instanceof Map<?, ?> dataMap) {
-            // General endpoint key
             Object fixtures = ((Map<?, ?>) dataMap).get("fixtures");
             if (fixtures instanceof List<?> list && !list.isEmpty()) {
                 log.debug("extractFixtureList: {} fixtures via data.fixtures", list.size());
                 return (List<Map<String, Object>>) list;
             }
-            // Competition-specific endpoint key (fallback)
             Object fixture = ((Map<?, ?>) dataMap).get("fixture");
             if (fixture instanceof List<?> list && !list.isEmpty()) {
                 log.debug("extractFixtureList: {} fixtures via data.fixture", list.size());
                 return (List<Map<String, Object>>) list;
             }
         }
-        // Last resort
         return extractMatchList(response, "fixtures", "fixture");
     }
 
