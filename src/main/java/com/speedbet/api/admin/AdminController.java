@@ -6,6 +6,7 @@ import com.speedbet.api.common.PageResponse;
 import com.speedbet.api.referral.Referral;
 import com.speedbet.api.referral.ReferralLink;
 import com.speedbet.api.referral.ReferralService;
+import com.speedbet.api.referral.ReferredUserDTO;
 import com.speedbet.api.user.User;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
@@ -42,30 +43,38 @@ public class AdminController {
         var wallet = walletService.getWallet(user.getId());
         var since = switch (range) {
             case "today" -> Instant.now().minus(1, ChronoUnit.DAYS);
-            case "30d" -> Instant.now().minus(30, ChronoUnit.DAYS);
-            default -> Instant.now().minus(7, ChronoUnit.DAYS);
+            case "30d"   -> Instant.now().minus(30, ChronoUnit.DAYS);
+            default      -> Instant.now().minus(7, ChronoUnit.DAYS);
         };
         var commission = walletService.getTransactions(user.getId(),
-            PageRequest.of(0, 1000)).getContent().stream()
-            .filter(t -> t.getKind() == TxKind.REFERRAL_COMMISSION && t.getCreatedAt().isAfter(since))
-            .map(t -> t.getAmount()).reduce(BigDecimal.ZERO, BigDecimal::add);
+                        PageRequest.of(0, 1000)).getContent().stream()
+                .filter(t -> t.getKind() == TxKind.REFERRAL_COMMISSION && t.getCreatedAt().isAfter(since))
+                .map(t -> t.getAmount())
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
-            "totalReferrals", referrals.size(),
-            "walletBalance", wallet.getBalance(),
-            "commissionInPeriod", commission,
-            "referrals", referrals.stream().map(r -> Map.of(
-                "userId", r.getUserId(),
-                "joinedAt", r.getJoinedAt(),
-                "lifetimeStake", r.getLifetimeStake(),
-                "lifetimeCommission", r.getLifetimeCommission()
-            )).toList()
+                "totalReferrals", referrals.size(),
+                "walletBalance", wallet.getBalance(),
+                "commissionInPeriod", commission,
+                "referrals", referrals.stream().map(r -> Map.of(
+                        "userId", r.getUserId(),
+                        "joinedAt", r.getJoinedAt(),
+                        "lifetimeStake", r.getLifetimeStake(),
+                        "lifetimeCommission", r.getLifetimeCommission()
+                )).toList()
         )));
     }
 
+    /**
+     * GET /api/admin/referred-users
+     * Returns referred users with full profile info (name, email, joinedAt, stake, commission)
+     * for the admin dashboard table.
+     */
     @GetMapping("/referred-users")
-    public ResponseEntity<ApiResponse<List<Referral>>> referredUsers(@AuthenticationPrincipal User user) {
-        return ResponseEntity.ok(ApiResponse.ok(referralService.getReferralsForAdmin(user.getId())));
+    public ResponseEntity<ApiResponse<List<ReferredUserDTO>>> referredUsers(
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(
+                ApiResponse.ok(referralService.getReferredUserDTOsForAdmin(user.getId())));
     }
 
     @PostMapping("/referral-links")
@@ -74,13 +83,14 @@ public class AdminController {
             @RequestBody Map<String, Object> req) {
         var label = req.getOrDefault("label", "My Link").toString();
         var commission = req.get("commissionPercent") != null
-            ? new BigDecimal(req.get("commissionPercent").toString()) : null;
+                ? new BigDecimal(req.get("commissionPercent").toString()) : null;
         var link = referralService.createLink(user.getId(), label, commission, null);
         return ResponseEntity.ok(ApiResponse.ok(link, "Referral link created"));
     }
 
     @GetMapping("/referral-links")
-    public ResponseEntity<ApiResponse<List<ReferralLink>>> getLinks(@AuthenticationPrincipal User user) {
+    public ResponseEntity<ApiResponse<List<ReferralLink>>> getLinks(
+            @AuthenticationPrincipal User user) {
         return ResponseEntity.ok(ApiResponse.ok(referralService.getLinksForAdmin(user.getId())));
     }
 
@@ -90,6 +100,6 @@ public class AdminController {
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "50") int size) {
         return ResponseEntity.ok(ApiResponse.ok(
-            new PageResponse<>(auditService.getAll(PageRequest.of(page, size)))));
+                new PageResponse<>(auditService.getAll(PageRequest.of(page, size)))));
     }
 }

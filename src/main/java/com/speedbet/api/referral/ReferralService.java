@@ -89,6 +89,13 @@ public class ReferralService {
         return referrals;
     }
 
+    /** Returns referred users with full user info (name, email, joinedAt) for the admin dashboard table. */
+    public List<ReferredUserDTO> getReferredUserDTOsForAdmin(UUID adminId) {
+        List<ReferredUserDTO> users = referralRepo.findReferredUserDTOsByAdminId(adminId);
+        log.info("getReferredUserDTOsForAdmin: adminId={} found={}", adminId, users.size());
+        return users;
+    }
+
     private String generateUniqueCode() {
         String code;
         int attempts = 0;
