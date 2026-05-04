@@ -5,6 +5,7 @@ import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.user.User;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -47,7 +48,7 @@ public class PaystackController {
         if (amount.compareTo(minDeposit) < 0)
             throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
 
-        var amountKobo = amount.multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64).intValue();
+        var amountPesewas = amount.multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64).intValue();
 
         @SuppressWarnings("unchecked")
         var response = (Map<String, Object>) webClientBuilder.build()
@@ -56,7 +57,7 @@ public class PaystackController {
                 .header("Content-Type", "application/json")
                 .bodyValue(Map.of(
                         "email", user.getEmail(),
-                        "amount", amountKobo,
+                        "amount", amountPesewas,
                         "currency", "GHS",
                         "callback_url", frontendUrl + "/app/wallet?payment=success",
                         "metadata", Map.of("userId", user.getId().toString())
@@ -70,15 +71,31 @@ public class PaystackController {
 
     @PostMapping("/api/webhooks/paystack")
     public ResponseEntity<String> webhook(
-            @RequestHeader("x-paystack-signature") String signature,
-            @RequestBody String payload) {
+            @RequestHeader(value = "x-paystack-signature", required = false) String signature,
+            HttpServletRequest request) {
 
-        if (!verifySignature(payload, signature)) {
+        // Read raw body bytes to ensure signature verification uses exact bytes Paystack sent
+        byte[] rawBody;
+        try {
+            rawBody = request.getInputStream().readAllBytes();
+        } catch (Exception e) {
+            log.error("Paystack webhook: failed to read request body", e);
+            return ResponseEntity.status(400).body("Failed to read body");
+        }
+
+        if (signature == null || signature.isBlank()) {
+            log.warn("Paystack webhook: missing x-paystack-signature header");
+            return ResponseEntity.status(400).body("Missing signature");
+        }
+
+        if (!verifySignature(rawBody, signature)) {
             log.warn("Paystack webhook: invalid signature received");
             return ResponseEntity.status(400).body("Invalid signature");
         }
 
         try {
+            var payload = new String(rawBody, StandardCharsets.UTF_8);
+
             @SuppressWarnings("unchecked")
             var event = (Map<String, Object>) new com.fasterxml.jackson.databind.ObjectMapper()
                     .readValue(payload, Map.class);
@@ -101,8 +118,8 @@ public class PaystackController {
 
                 var userId = UUID.fromString(metadata.get("userId").toString());
                 var ref = data.get("reference").toString();
-                var amountKobo = Long.parseLong(data.get("amount").toString());
-                var amount = BigDecimal.valueOf(amountKobo).divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
+                var amountPesewas = Long.parseLong(data.get("amount").toString());
+                var amount = BigDecimal.valueOf(amountPesewas).divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
 
                 log.info("Paystack webhook: processing deposit GHS {} for userId={} ref={}", amount, userId, ref);
 
@@ -111,13 +128,11 @@ public class PaystackController {
                             Map.of("provider", "paystack", "reference", ref));
                     log.info("Paystack webhook: deposit GHS {} credited to userId={} ref={}", amount, userId, ref);
                 } catch (ApiException ex) {
-                    // FIX: use .value() to compare HttpStatus to int
                     if (ex.getStatus().value() == 409) {
-                        // WalletService idempotency already caught this duplicate — safe to ignore
                         log.warn("Paystack webhook: duplicate ref={} already processed — skipping", ref);
                         return ResponseEntity.ok("Already processed");
                     }
-                    throw ex; // re-throw anything else so outer catch handles it
+                    throw ex;
                 }
 
             } else {
@@ -125,11 +140,9 @@ public class PaystackController {
             }
 
         } catch (ApiException e) {
-            // Bad data, no point retrying — return 400
             log.error("Paystack webhook: bad request — {}", e.getMessage(), e);
             return ResponseEntity.status(400).body("Bad request: " + e.getMessage());
         } catch (Exception e) {
-            // Unexpected error — return 500 so Paystack retries automatically
             log.error("Paystack webhook: unexpected error — will retry", e);
             return ResponseEntity.status(500).body("Processing error");
         }
@@ -137,11 +150,12 @@ public class PaystackController {
         return ResponseEntity.ok("OK");
     }
 
-    private boolean verifySignature(String payload, String signature) {
+    // Verify using raw bytes — avoids any charset/encoding mismatch
+    private boolean verifySignature(byte[] rawBody, String signature) {
         try {
             var mac = Mac.getInstance("HmacSHA512");
             mac.init(new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA512"));
-            var hash = HexFormat.of().formatHex(mac.doFinal(payload.getBytes(StandardCharsets.UTF_8)));
+            var hash = HexFormat.of().formatHex(mac.doFinal(rawBody));
             return hash.equals(signature);
         } catch (Exception e) {
             log.error("Paystack webhook: signature verification error", e);
