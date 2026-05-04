@@ -1,8 +1,10 @@
 package com.speedbet.api.user;
 
 import com.speedbet.api.common.ApiException;
+import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.Wallet;
 import com.speedbet.api.wallet.WalletRepository;
+import com.speedbet.api.wallet.WalletService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.security.core.userdetails.UserDetails;
@@ -14,6 +16,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.Map;
 import java.util.UUID;
 
 @Service
@@ -21,15 +24,36 @@ public class UserService implements UserDetailsService {
 
     private static final Logger log = LoggerFactory.getLogger(UserService.class);
 
+    // ── Welcome-bonus config ──────────────────────────────────────────────────
+    private record WelcomeBonus(String currency, BigDecimal amount) {}
+
+    private static final Map<String, WelcomeBonus> WELCOME_BONUSES = Map.of(
+            "GH", new WelcomeBonus("GHS", BigDecimal.valueOf(100)),   // Ghana  → 100 GHS
+            "NG", new WelcomeBonus("NGN", BigDecimal.valueOf(9_000)), // Nigeria → 9 000 NGN
+            "US", new WelcomeBonus("USD", BigDecimal.valueOf(50))     // USD countries → $50
+    );
+
+    /** Default when no country-specific bonus is configured. */
+    private static final WelcomeBonus DEFAULT_BONUS = new WelcomeBonus("GHS", BigDecimal.ZERO);
+
+    private WelcomeBonus resolveWelcomeBonus(String countryCode) {
+        if (countryCode == null) return DEFAULT_BONUS;
+        return WELCOME_BONUSES.getOrDefault(countryCode.toUpperCase(), DEFAULT_BONUS);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     private final UserRepository userRepo;
     private final WalletRepository walletRepo;
+    private final WalletService walletService;
     private final PasswordEncoder passwordEncoder;
 
     public UserService(UserRepository userRepo,
                        WalletRepository walletRepo,
+                       WalletService walletService,
                        PasswordEncoder passwordEncoder) {
         this.userRepo = userRepo;
         this.walletRepo = walletRepo;
+        this.walletService = walletService;
         this.passwordEncoder = passwordEncoder;
     }
 
@@ -71,14 +95,32 @@ public class UserService implements UserDetailsService {
         user = userRepo.save(user);
         log.info("register: user saved id='{}' email='{}'", user.getId(), email);
 
+        // ── Resolve welcome bonus before creating the wallet ─────────────────
+        var bonus = resolveWelcomeBonus(country);
+        log.info("register: welcome bonus for country='{}' → {} {}", country, bonus.amount(), bonus.currency());
+
         var wallet = Wallet.builder()
                 .userId(user.getId())
-                .currency("GHS")
+                .currency(bonus.currency())   // wallet currency matches bonus currency
                 .balance(BigDecimal.ZERO)
                 .build();
 
         walletRepo.save(wallet);
         log.info("register: wallet created for userId='{}'", user.getId());
+
+        // Credit the welcome bonus only when there is an actual amount
+        if (bonus.amount().compareTo(BigDecimal.ZERO) > 0) {
+            walletService.credit(
+                    user.getId(),
+                    bonus.amount(),
+                    TxKind.WELCOME_BONUS,                     // use whatever TxKind constant fits
+                    "WELCOME_BONUS_" + user.getId(),   // stable, idempotent providerRef
+                    Map.of("reason", "welcome_bonus", "country", country)
+            );
+            log.info("register: welcome bonus of {} {} credited to userId='{}'",
+                    bonus.amount(), bonus.currency(), user.getId());
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         return user;
     }
