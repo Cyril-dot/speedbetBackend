@@ -36,6 +36,18 @@ public class BookingCode {
     @Builder.Default
     private String kind = "MIXED";
 
+    /**
+     * Indicates how this booking code was created:
+     *   "STANDARD"   — original create() path, no fixture-source restriction.
+     *   "ADMIN_ONLY" — all fixtures are ADMIN_CREATED and owned by the creator admin.
+     *   "MIXED"      — admin's own fixtures combined with external-feed fixtures.
+     *
+     * Defaults to "STANDARD" so existing rows and the original create() path
+     * require no migration or code change.
+     */
+    @Column(name = "booking_type", nullable = false, length = 20)
+    @Builder.Default
+    private String bookingType = "STANDARD";
 
     @Column(nullable = false)
     @Builder.Default

@@ -1,7 +1,9 @@
 package com.speedbet.api.booking;
 
 import com.speedbet.api.common.ApiException;
+import com.speedbet.api.match.Match;
 import com.speedbet.api.match.MatchRepository;
+import com.speedbet.api.match.MatchSource;
 import com.speedbet.api.odds.OddsRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -25,11 +27,16 @@ import java.util.UUID;
 public class BookingService {
 
     private static final String CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    private static final int CODE_LENGTH = 8;
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private final BookingCodeRepository bookingRepo;
     private final MatchRepository matchRepo;
     private final OddsRepository oddsRepo;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ORIGINAL CREATE  (unchanged — external/public booking codes)
+    // ══════════════════════════════════════════════════════════════════════
 
     @Transactional
     public BookingCode create(CreateBookingRequest req, UUID adminId) {
@@ -38,20 +45,10 @@ public class BookingService {
 
         validateSelections(req.selections());
 
-        BigDecimal totalOdds = req.selections().stream()
-                .map(s -> new BigDecimal(s.get("odds").toString()))
-                .reduce(BigDecimal.ONE, (a, b) -> a.multiply(b, MathContext.DECIMAL64));
-
-        BigDecimal potentialPayout = req.stake() != null
-                ? req.stake().multiply(totalOdds, MathContext.DECIMAL64)
-                : null;
-
-        String currency = (req.currency() != null && !req.currency().isBlank())
-                ? req.currency() : "GHS";
-
-        String kind = (req.kind() != null && !req.kind().isBlank())
-                ? req.kind().toUpperCase()
-                : deriveKind(req.selections());
+        BigDecimal totalOdds = computeTotalOdds(req.selections());
+        BigDecimal potentialPayout = computePayout(req.stake(), totalOdds);
+        String currency = resolveCurrency(req.currency());
+        String kind = resolveKind(req.kind(), req.selections());
 
         BookingCode saved = bookingRepo.save(BookingCode.builder()
                 .code(generateUniqueCode())
@@ -65,6 +62,7 @@ public class BookingService {
                 .potentialPayout(potentialPayout)
                 .maxRedemptions(req.maxRedemptions())
                 .expiresAt(req.expiresAt())
+                // bookingType defaults to "STANDARD" via @Builder.Default
                 .build());
 
         log.info("createBookingCode: success — code={} id={} kind={} totalOdds={} payout={}",
@@ -72,6 +70,110 @@ public class BookingService {
 
         return saved;
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // NEW: ADMIN-ONLY BOOKING CODE
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Creates a booking code whose selections are restricted to matches that
+     * this admin personally created (source = ADMIN_CREATED, createdByAdminId
+     * = adminId).
+     *
+     * Every fixture_id in the request is looked up and ownership is enforced
+     * before the code is persisted. Any fixture that is not found, belongs to
+     * a different admin, or comes from an external feed causes a 400 error so
+     * the admin gets clear feedback on exactly which selection failed.
+     *
+     * Wire up to: POST /admin/booking-codes/admin-only
+     */
+    @Transactional
+    public BookingCode createAdminOnly(CreateBookingRequest req, UUID adminId) {
+        log.info("createAdminOnlyBookingCode: adminId={} label='{}' kind={} stake={} selections={}",
+                adminId, req.label(), req.kind(), req.stake(), req.selections().size());
+
+        validateSelections(req.selections());
+        validateAdminOwnedSelections(req.selections(), adminId);
+
+        BigDecimal totalOdds = computeTotalOdds(req.selections());
+        BigDecimal potentialPayout = computePayout(req.stake(), totalOdds);
+        String currency = resolveCurrency(req.currency());
+        String kind = resolveKind(req.kind(), req.selections());
+
+        BookingCode saved = bookingRepo.save(BookingCode.builder()
+                .code(generateUniqueCode())
+                .creatorAdminId(adminId)
+                .label(req.label())
+                .kind(kind)
+                .currency(currency)
+                .stake(req.stake())
+                .selections(req.selections())
+                .totalOdds(totalOdds)
+                .potentialPayout(potentialPayout)
+                .maxRedemptions(req.maxRedemptions())
+                .expiresAt(req.expiresAt())
+                .bookingType("ADMIN_ONLY")
+                .build());
+
+        log.info("createAdminOnlyBookingCode: success — code={} id={} kind={} totalOdds={} payout={}",
+                saved.getCode(), saved.getId(), saved.getKind(), totalOdds, potentialPayout);
+
+        return saved;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // NEW: MIXED BOOKING CODE  (admin games + external-feed games)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Creates a booking code that can combine the calling admin's own matches
+     * with external-feed matches (MatchSource.EXTERNAL) in a single slip.
+     *
+     * Ownership rules enforced per selection:
+     *   • ADMIN_CREATED fixture owned by this admin → allowed.
+     *   • ADMIN_CREATED fixture owned by another admin → rejected (404-style message).
+     *   • EXTERNAL fixture → always allowed.
+     *   • Unknown fixture_id → rejected with 400.
+     *
+     * Wire up to: POST /admin/booking-codes/mixed
+     */
+    @Transactional
+    public BookingCode createMixed(CreateBookingRequest req, UUID adminId) {
+        log.info("createMixedBookingCode: adminId={} label='{}' kind={} stake={} selections={}",
+                adminId, req.label(), req.kind(), req.stake(), req.selections().size());
+
+        validateSelections(req.selections());
+        validateMixedSelections(req.selections(), adminId);
+
+        BigDecimal totalOdds = computeTotalOdds(req.selections());
+        BigDecimal potentialPayout = computePayout(req.stake(), totalOdds);
+        String currency = resolveCurrency(req.currency());
+        String kind = resolveKind(req.kind(), req.selections());
+
+        BookingCode saved = bookingRepo.save(BookingCode.builder()
+                .code(generateUniqueCode())
+                .creatorAdminId(adminId)
+                .label(req.label())
+                .kind(kind)
+                .currency(currency)
+                .stake(req.stake())
+                .selections(req.selections())
+                .totalOdds(totalOdds)
+                .potentialPayout(potentialPayout)
+                .maxRedemptions(req.maxRedemptions())
+                .expiresAt(req.expiresAt())
+                .bookingType("MIXED")
+                .build());
+
+        log.info("createMixedBookingCode: success — code={} id={} kind={} totalOdds={} payout={}",
+                saved.getCode(), saved.getId(), saved.getKind(), totalOdds, potentialPayout);
+
+        return saved;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // REDEEM  (unchanged except redundant cast removed)
+    // ══════════════════════════════════════════════════════════════════════
 
     @Transactional
     public RedeemResponse redeem(String code) {
@@ -93,17 +195,15 @@ public class BookingService {
 
         log.info("redeemBookingCode: code={} redemptionCount={}", code, booking.getRedemptionCount());
 
-        var enrichedSelections = booking.getSelections().stream().map(sel -> {
-            var enriched = new HashMap<>(sel);
-            // FIX: guard against null fixture_id / market / pick before enriching
+        List<Map<String, Object>> enrichedSelections = booking.getSelections().stream().map(sel -> {
+            Map<String, Object> enriched = new HashMap<>(sel);
             Object fixtureIdRaw = sel.get("fixture_id");
             Object marketRaw    = sel.get("market");
             Object pickRaw      = sel.get("pick");
 
             if (fixtureIdRaw == null || marketRaw == null || pickRaw == null) {
-                log.warn("redeemBookingCode: selection missing required field(s) — skipping enrichment for sel={}",
-                        sel);
-                return (Map<String, Object>) enriched;
+                log.warn("redeemBookingCode: selection missing required field(s) — skipping enrichment for sel={}", sel);
+                return enriched;
             }
 
             try {
@@ -122,15 +222,17 @@ public class BookingService {
                 log.warn("redeemBookingCode: failed to enrich selection fixture_id={} — {}",
                         fixtureIdRaw, e.getMessage());
             }
-            return (Map<String, Object>) enriched;
+            return enriched;
         }).toList();
 
-        BigDecimal currentTotalOdds = enrichedSelections.stream()
-                .map(s -> new BigDecimal(s.get("odds").toString()))
-                .reduce(BigDecimal.ONE, (a, b) -> a.multiply(b, MathContext.DECIMAL64));
+        BigDecimal currentTotalOdds = computeTotalOdds(enrichedSelections);
 
         return new RedeemResponse(booking, enrichedSelections, currentTotalOdds);
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // READ  (unchanged)
+    // ══════════════════════════════════════════════════════════════════════
 
     public Page<BookingCode> getForAdmin(UUID adminId, Pageable pageable) {
         log.info("getBookingCodesForAdmin: adminId={}", adminId);
@@ -146,25 +248,58 @@ public class BookingService {
         return code;
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // NEW VALIDATION HELPERS
+    // ══════════════════════════════════════════════════════════════════════
 
-    private String deriveKind(List<Map<String, Object>> selections) {
-        if (selections == null || selections.isEmpty()) return "MIXED";
-        var markets = selections.stream()
-                .map(s -> s.get("market") == null ? "" : s.get("market").toString().toUpperCase())
-                .distinct()
-                .toList();
-        return markets.size() == 1 ? markets.get(0) : "MIXED";
+    /**
+     * All fixtures must be ADMIN_CREATED and owned by the calling admin.
+     * Called exclusively by {@link #createAdminOnly}.
+     */
+    private void validateAdminOwnedSelections(List<Map<String, Object>> selections, UUID adminId) {
+        for (var sel : selections) {
+            UUID fixtureId = UUID.fromString(sel.get("fixture_id").toString());
+            Match match = matchRepo.findById(fixtureId)
+                    .orElseThrow(() -> ApiException.badRequest("Fixture not found: " + fixtureId));
+
+            if (match.getSource() != MatchSource.ADMIN_CREATED)
+                throw ApiException.badRequest(
+                        "Fixture " + fixtureId + " is not an admin-created match. " +
+                                "Admin-only booking codes must use your own fixtures.");
+
+            if (!adminId.equals(match.getCreatedByAdminId()))
+                throw ApiException.badRequest(
+                        "Fixture " + fixtureId + " does not belong to your account.");
+        }
     }
 
     /**
-     * FIX: per-selection field validation now runs BEFORE the duplicate fixture_id
-     * check so we never call .toString() on a potentially null fixture_id.
-     *
-     * Order:
-     *   1. Null / size guards
-     *   2. Per-selection field presence + odds floor  ← moved up
-     *   3. Duplicate fixture_id check                 ← moved down (safe now)
+     * ADMIN_CREATED fixtures must be owned by this admin.
+     * EXTERNAL fixtures pass freely.
+     * Called exclusively by {@link #createMixed}.
+     */
+    private void validateMixedSelections(List<Map<String, Object>> selections, UUID adminId) {
+        for (var sel : selections) {
+            UUID fixtureId = UUID.fromString(sel.get("fixture_id").toString());
+            Match match = matchRepo.findById(fixtureId)
+                    .orElseThrow(() -> ApiException.badRequest("Fixture not found: " + fixtureId));
+
+            if (match.getSource() == MatchSource.ADMIN_CREATED
+                    && !adminId.equals(match.getCreatedByAdminId()))
+                throw ApiException.badRequest(
+                        "Fixture " + fixtureId + " does not belong to your account.");
+
+            // MatchSource.EXTERNAL — no ownership check needed
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // EXISTING HELPERS  (validateSelections unchanged; generateCode inlined)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * FIX: per-selection field validation runs BEFORE the duplicate fixture_id
+     * check so we never call .toString() on a null fixture_id.
      */
     private void validateSelections(List<Map<String, Object>> selections) {
         if (selections == null || selections.isEmpty())
@@ -172,7 +307,6 @@ public class BookingService {
         if (selections.size() > 20)
             throw ApiException.badRequest("Max 20 selections");
 
-        // FIX: validate each selection's required fields FIRST
         for (var sel : selections) {
             if (sel.get("fixture_id") == null)
                 throw ApiException.badRequest("Selection missing fixture_id");
@@ -188,7 +322,6 @@ public class BookingService {
                 throw ApiException.badRequest("Minimum odds per selection is 1.10");
         }
 
-        // Safe to call .toString() now — fixture_id is guaranteed non-null above
         var fixtureIds = selections.stream()
                 .map(s -> s.get("fixture_id").toString())
                 .toList();
@@ -200,20 +333,47 @@ public class BookingService {
         String code;
         int attempts = 0;
         do {
-            code = generateCode(8);
+            // Build an 8-char code inline — length is always CODE_LENGTH so no
+            // need for a separate parameterised method (removes "value always 8" warning)
+            var sb = new StringBuilder(CODE_LENGTH);
+            for (int i = 0; i < CODE_LENGTH; i++)
+                sb.append(CHARSET.charAt(RANDOM.nextInt(CHARSET.length())));
+            code = sb.toString();
             attempts++;
         } while (bookingRepo.existsByCode(code));
         log.debug("generateUniqueCode: code={} attempts={}", code, attempts);
         return code;
     }
 
-    private String generateCode(int len) {
-        var sb = new StringBuilder(len);
-        for (int i = 0; i < len; i++) sb.append(CHARSET.charAt(RANDOM.nextInt(CHARSET.length())));
-        return sb.toString();
+    // ── Small computation helpers shared across all three create methods ──
+
+    private BigDecimal computeTotalOdds(List<Map<String, Object>> selections) {
+        return selections.stream()
+                .map(s -> new BigDecimal(s.get("odds").toString()))
+                .reduce(BigDecimal.ONE, (a, b) -> a.multiply(b, MathContext.DECIMAL64));
     }
 
-    // ── DTOs ───────────────────────────────────────────────────────────────────
+    private BigDecimal computePayout(BigDecimal stake, BigDecimal totalOdds) {
+        return stake != null ? stake.multiply(totalOdds, MathContext.DECIMAL64) : null;
+    }
+
+    private String resolveCurrency(String currency) {
+        return (currency != null && !currency.isBlank()) ? currency : "GHS";
+    }
+
+    private String resolveKind(String kind, List<Map<String, Object>> selections) {
+        if (kind != null && !kind.isBlank()) return kind.toUpperCase();
+        if (selections == null || selections.isEmpty()) return "MIXED";
+        var markets = selections.stream()
+                .map(s -> s.get("market") == null ? "" : s.get("market").toString().toUpperCase())
+                .distinct()
+                .toList();
+        return markets.size() == 1 ? markets.get(0) : "MIXED";
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // DTOs  (unchanged)
+    // ══════════════════════════════════════════════════════════════════════
 
     public record CreateBookingRequest(
             String kind,
