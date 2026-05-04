@@ -29,7 +29,8 @@ public class ReferralService {
     private final WalletService walletService;
 
     public Optional<UUID> findLinkIdByCode(String code) {
-        Optional<UUID> result = linkRepo.findByCodeAndActiveTrue(code).map(ReferralLink::getId);
+        Optional<UUID> result = linkRepo.findValidByCode(code, Instant.now())
+                .map(ReferralLink::getId);
         log.info("findLinkIdByCode: code={} found={}", code, result.isPresent());
         return result;
     }
@@ -47,20 +48,35 @@ public class ReferralService {
     @Transactional
     public void attributeCommission(UUID userId, BigDecimal stake) {
         log.info("attributeCommission: userId={} stake={}", userId, stake);
-        referralRepo.findByUserId(userId).ifPresent(referral -> {
-            linkRepo.findById(referral.getLinkId()).ifPresent(link -> {
-                var commission = stake.multiply(
-                        link.getCommissionPercent().divide(BigDecimal.valueOf(100), MathContext.DECIMAL64));
-                referral.setLifetimeStake(referral.getLifetimeStake().add(stake));
-                referral.setLifetimeCommission(referral.getLifetimeCommission().add(commission));
-                referralRepo.save(referral);
 
-                walletService.credit(link.getAdminId(), commission,
-                        TxKind.REFERRAL_COMMISSION, "REF-" + userId + "-" + System.currentTimeMillis(),
-                        Map.of("userId", userId.toString(), "stake", stake.toString()));
-                log.info("attributeCommission: GHS {} credited to adminId={} for userId={}", commission, link.getAdminId(), userId);
-            });
-        });
+        Referral referral = referralRepo.findByUserId(userId).orElse(null);
+        if (referral == null) {
+            log.warn("attributeCommission: no referral found for userId={}, skipping", userId);
+            return;
+        }
+
+        ReferralLink link = linkRepo.findById(referral.getLinkId()).orElse(null);
+        if (link == null) {
+            log.warn("attributeCommission: linkId={} not found for userId={}, skipping",
+                    referral.getLinkId(), userId);
+            return;
+        }
+
+        var commission = stake.multiply(
+                link.getCommissionPercent().divide(BigDecimal.valueOf(100), MathContext.DECIMAL64));
+
+        referral.setLifetimeStake(referral.getLifetimeStake().add(stake));
+        referral.setLifetimeCommission(referral.getLifetimeCommission().add(commission));
+        referralRepo.save(referral);
+
+        walletService.credit(
+                link.getAdminId(), commission,
+                TxKind.REFERRAL_COMMISSION,
+                "REF-" + userId + "-" + System.currentTimeMillis(),
+                Map.of("userId", userId.toString(), "stake", stake.toString()));
+
+        log.info("attributeCommission: GHS {} credited to adminId={} for userId={}",
+                commission, link.getAdminId(), userId);
     }
 
     @Transactional
@@ -89,7 +105,6 @@ public class ReferralService {
         return referrals;
     }
 
-    /** Returns referred users with full user info (name, email, joinedAt) for the admin dashboard table. */
     public List<ReferredUserDTO> getReferredUserDTOsForAdmin(UUID adminId) {
         List<ReferredUserDTO> users = referralRepo.findReferredUserDTOsByAdminId(adminId);
         log.info("getReferredUserDTOsForAdmin: adminId={} found={}", adminId, users.size());
@@ -97,14 +112,16 @@ public class ReferralService {
     }
 
     private String generateUniqueCode() {
-        String code;
-        int attempts = 0;
-        do {
-            code = generateCode(8);
-            attempts++;
-        } while (linkRepo.findByCode(code).isPresent());
-        log.debug("generateUniqueCode: code={} attempts={}", code, attempts);
-        return code;
+        int maxAttempts = 10;
+        for (int attempts = 1; attempts <= maxAttempts; attempts++) {
+            String code = generateCode(8);
+            if (linkRepo.findByCode(code).isEmpty()) {
+                log.debug("generateUniqueCode: code={} attempts={}", code, attempts);
+                return code;
+            }
+        }
+        throw new IllegalStateException(
+                "Could not generate a unique referral code after " + maxAttempts + " attempts");
     }
 
     private String generateCode(int length) {
